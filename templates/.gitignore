@@ -1,0 +1,8 @@
+# Build output
+dist/
+
+# Lua cache and temp files
+*.luac
+
+# OS files
+.DS_Store
