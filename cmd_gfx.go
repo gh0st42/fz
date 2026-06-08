@@ -17,15 +17,15 @@ import (
 // ── virtual canvas ────────────────────────────────────────────────────────────
 
 const (
-	virtualW = int32(656)
-	virtualH = int32(504) // extra 24px below toolbox for the tile-flags row
+	virtualW = int32(640)
+	virtualH = int32(480)
 
 	toolbarH   = int32(28)
 	statusBarH = int32(20)
 
 	drawAreaX  = int32(4)
 	drawAreaY  = toolbarH + 4 // 32
-	drawAreaSz = int32(384) // screen pixels for the single-tile editing area
+	drawAreaSz = int32(320) // screen pixels for the single-tile editing area
 )
 
 // ── right panel layout ────────────────────────────────────────────────────────
@@ -38,14 +38,14 @@ const (
 	palCols   = int32(8)
 	swatchSz  = int32(24)
 	swatchGap = int32(2)
-	palStartX = panelX + 4
+	// Palette swatches centred in the right panel (same centre as the sheet preview).
+	palStartX = panelX + (panelW-palCols*(swatchSz+swatchGap)+swatchGap)/2 // 379
 	palStartY = drawAreaY + 14 // below "PALETTE" label
 
-	// Sheet preview (below palette, ~y=202)
-	// previewSz is the fixed on-screen budget; quadrant size and scale are dynamic.
-	previewSz = int32(192)
-	previewX  = panelX + (panelW-previewSz)/2 // centred in panel: 418
-	sheetTabY    = int32(202)
+	// Sheet preview (below palette)
+	previewSz = int32(192) // kept for previewX; actual render size comes from previewLayout()
+	previewX  = panelX + (panelW-previewSz)/2
+	sheetTabY    = int32(178) // preview bottom = 198+256=454, leaving 6px gap to status bar
 	sheetTabH    = int32(18)
 	previewGridY = sheetTabY + sheetTabH + 2 // where tiles start: 222
 
@@ -54,7 +54,10 @@ const (
 	toolboxBtnSz = int32(24)
 
 	// Tile-flags row below the toolbox
-	flagsRowY = toolboxY + toolboxBtnSz + 6 // 450
+	flagsRowY = toolboxY + toolboxBtnSz + 6
+
+	// Selected-colour patch in the gap between flags row and status bar
+	colorInfoY = flagsRowY + 26 // ~412: patch ends at 448, leaving gap before status bar
 )
 
 // ── palette ───────────────────────────────────────────────────────────────────
@@ -489,6 +492,7 @@ func drawGfxScene(s *gfxState) {
 	drawPalettePanel(s)
 	drawSheetPreview(s)
 	drawStatusBar(s)
+	drawColorInfo(s)
 	drawSaveDialog(s)      // modal overlay — drawn last so it sits on top
 	drawToolbarDropdown(s) // expanded dropdown must render above all other content
 	drawHelpPage(s)        // help overlay is topmost
@@ -592,7 +596,9 @@ func drawTileEditor(s *gfxState) {
 }
 
 func drawPalettePanel(s *gfxState) {
-	rl.DrawText("PALETTE", palStartX, drawAreaY, 10, rl.NewColor(180, 180, 180, 255))
+	lw := rl.MeasureText("PALETTE", 10)
+	rl.DrawText("PALETTE", palStartX+(palCols*(swatchSz+swatchGap)-swatchGap-lw)/2, drawAreaY,
+		10, rl.NewColor(180, 180, 180, 255))
 
 	for i, c := range picotronPalette {
 		col := int32(i) % palCols
@@ -605,24 +611,6 @@ func drawPalettePanel(s *gfxState) {
 			rl.DrawRectangleLines(x-1, y-1, swatchSz+2, swatchSz+2, rl.NewColor(0, 0, 0, 180))
 		}
 	}
-
-	// Divider + selected colour preview.
-	palGridH := (swatchSz+swatchGap)*int32(len(picotronPalette))/palCols - swatchGap
-	divY := palStartY + palGridH + 6
-	rl.DrawLine(palStartX, divY, palStartX+palCols*(swatchSz+swatchGap)-swatchGap, divY,
-		rl.NewColor(60, 60, 60, 255))
-
-	previewY := divY + 4
-	previewSwatch := int32(36)
-	selC := picotronPalette[s.selectedColor]
-	rl.DrawRectangle(palStartX, previewY, previewSwatch, previewSwatch, selC)
-	rl.DrawRectangleLines(palStartX-1, previewY-1, previewSwatch+2, previewSwatch+2,
-		rl.NewColor(80, 80, 80, 255))
-	lx := palStartX + previewSwatch + 6
-	rl.DrawText(fmt.Sprintf("#%02x%02x%02x", selC.R, selC.G, selC.B), lx, previewY+2, 10,
-		rl.NewColor(200, 200, 200, 255))
-	rl.DrawText(fmt.Sprintf("idx %d", s.selectedColor), lx, previewY+16, 10,
-		rl.NewColor(140, 140, 140, 255))
 }
 
 // drawSheetPreview renders the tabbed quadrant preview in the lower-right panel.
@@ -734,6 +722,23 @@ func drawSheetPreview(s *gfxState) {
 	rl.DrawRectangleLines(px-1, previewGridY-1, sz+2, sz+2, rl.NewColor(60, 60, 60, 255))
 }
 
+func drawColorInfo(s *gfxState) {
+	if s.dialog.active {
+		return
+	}
+	const patchSz = int32(36)
+	const px = drawAreaX + 4
+	const py = colorInfoY
+	selC := picotronPalette[s.selectedColor]
+	rl.DrawRectangle(px, py, patchSz, patchSz, selC)
+	rl.DrawRectangleLines(px-1, py-1, patchSz+2, patchSz+2, rl.NewColor(80, 80, 80, 255))
+	tx := px + patchSz + 6
+	rl.DrawText(fmt.Sprintf("#%02x%02x%02x", selC.R, selC.G, selC.B), tx, py+6, 10,
+		rl.NewColor(200, 200, 200, 255))
+	rl.DrawText(fmt.Sprintf("idx %d", s.selectedColor), tx, py+20, 10,
+		rl.NewColor(140, 140, 140, 255))
+}
+
 func drawStatusBar(s *gfxState) {
 	y := virtualH - statusBarH
 	rl.DrawRectangle(0, y, virtualW, statusBarH, rl.NewColor(30, 30, 30, 255))
@@ -748,8 +753,9 @@ func drawStatusBar(s *gfxState) {
 		symStr = "on"
 	}
 	status := fmt.Sprintf(
-		"Sheet: %dpx  Tile: %dpx  #%d (%d,%d)/%d  |  Grid: %s [G]  |  Symmetry: %s [+]  |  Size: [S]",
+		"Sheet: %dpx  Tile: %dpx  #%d (%d,%d)/%d  Flags: 0x%02X  |  Grid: %s  Sym: %s  Tool: [P/F/E]",
 		s.sheetSz, s.tileSize, s.tileIndex(), s.tileX, s.tileY, s.tileCount()-1,
+		s.tileFlags[s.tileIndex()],
 		gridStr, symStr,
 	)
 	rl.DrawText(status, 4, y+5, 10, rl.LightGray)
@@ -1408,10 +1414,6 @@ func drawTileFlags(s *gfxState) {
 		}
 		x += step
 	}
-
-	current := s.tileFlags[tileID]
-	rl.DrawText(fmt.Sprintf("= 0x%02X", current),
-		int32(x)+4, int32(y)+2, 10, rl.NewColor(130, 180, 130, 255))
 }
 
 // ── resolve image path ────────────────────────────────────────────────────────
