@@ -17,7 +17,7 @@ import (
 // ── virtual canvas ────────────────────────────────────────────────────────────
 
 const (
-	virtualW = int32(640)
+	virtualW = int32(656)
 	virtualH = int32(504) // extra 24px below toolbox for the tile-flags row
 
 	toolbarH   = int32(28)
@@ -144,6 +144,10 @@ type gfxState struct {
 	texDirty       bool // image was modified; texture needs uploading before next draw
 	tileFlags      map[int]uint8 // tile index → 8-bit flag mask; zero entries omitted
 	showHelp       bool
+	toast          struct {
+		msg   string
+		until float64
+	}
 
 	// file switcher dropdown
 	fileList   []string // basenames of .png files found in assets/gfx
@@ -169,9 +173,33 @@ func (s *gfxState) tileCount() int {
 // quadrantSz returns the pixel size of one sheet quadrant (half the sheet).
 func (s *gfxState) quadrantSz() int { return s.sheetSz / 2 }
 
-// previewScaleF returns the float scale factor from quadrant pixels to screen pixels.
+// previewLayout returns the pixel-perfect position and rendered size of the
+// sheet preview. It uses the largest integer scale that fits in the panel so
+// every sheet pixel maps to exactly the same number of screen pixels.
+func (s *gfxState) previewLayout() (px, sz, scale int32) {
+	qSz := int32(s.quadrantSz())
+	maxW := panelW - 4
+	scale = maxW / qSz
+	if scale < 1 {
+		scale = 1
+	}
+	sz = qSz * scale
+	if sz > maxW {
+		sz = maxW // very large sheet: accept non-integer scale rather than overflow
+	}
+	px = panelX + (panelW-sz)/2
+	return
+}
+
+// previewScaleF is kept for callers that need a float; it delegates to previewLayout.
 func (s *gfxState) previewScaleF() float32 {
-	return float32(previewSz) / float32(s.quadrantSz())
+	_, _, scale := s.previewLayout()
+	return float32(scale)
+}
+
+func (s *gfxState) notify(msg string) {
+	s.toast.msg = msg
+	s.toast.until = float64(rl.GetTime()) + 1.6
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -290,12 +318,16 @@ func handleGfxInput(s *gfxState) {
 			triggerSave(s)
 		case rl.IsKeyPressed(rl.KeyC):
 			s.tileCopy()
+			s.notify("Copied")
 		case rl.IsKeyPressed(rl.KeyX):
 			s.tileCut()
+			s.notify("Cut")
 		case rl.IsKeyPressed(rl.KeyV):
 			s.tilePaste()
+			s.notify("Pasted")
 		case rl.IsKeyPressed(rl.KeyD):
 			s.tileClear()
+			s.notify("Cleared")
 		}
 		return
 	}
@@ -460,6 +492,7 @@ func drawGfxScene(s *gfxState) {
 	drawSaveDialog(s)      // modal overlay — drawn last so it sits on top
 	drawToolbarDropdown(s) // expanded dropdown must render above all other content
 	drawHelpPage(s)        // help overlay is topmost
+	drawNotification(s)    // transient toast is always on top
 }
 
 func drawToolbar(s *gfxState) {
@@ -505,32 +538,34 @@ func drawToolbarDropdown(s *gfxState) {
 func drawTileEditor(s *gfxState) {
 	zoom := s.tileZoom()
 	tsz := int32(s.tileSize)
-
-	// Checkerboard background: one cell per tile pixel.
-	for row := range tsz {
-		for col := range tsz {
-			x := drawAreaX + col*zoom
-			y := drawAreaY + row*zoom
-			var c rl.Color
-			if (row+col)%2 == 0 {
-				c = rl.NewColor(160, 160, 160, 255)
-			} else {
-				c = rl.NewColor(100, 100, 100, 255)
-			}
-			rl.DrawRectangle(x, y, zoom, zoom, c)
-		}
-	}
-
-	// Draw each tile pixel as a rectangle read straight from the image.
 	baseX := int32(s.tileX * s.tileSize)
 	baseY := int32(s.tileY * s.tileSize)
+
+	// Sub-cell checker size: half the zoomed pixel width so each cell shows a 2×2 pattern.
+	csz := zoom / 2
+	if csz < 1 {
+		csz = 1
+	}
+	chk := [2]rl.Color{
+		rl.NewColor(232, 232, 232, 255),
+		rl.NewColor(196, 196, 196, 255),
+	}
+
 	for row := range tsz {
 		for col := range tsz {
+			cx := drawAreaX + col*zoom
+			cy := drawAreaY + row*zoom
 			c := rl.GetImageColor(*s.img, baseX+col, baseY+row)
 			if c.A == 0 {
-				continue
+				// Draw a fine checkerboard within this cell to signal transparency.
+				for sy := int32(0); sy < zoom; sy += csz {
+					for sx := int32(0); sx < zoom; sx += csz {
+						rl.DrawRectangle(cx+sx, cy+sy, csz, csz, chk[((sx/csz)+(sy/csz))%2])
+					}
+				}
+			} else {
+				rl.DrawRectangle(cx, cy, zoom, zoom, c)
 			}
-			rl.DrawRectangle(drawAreaX+col*zoom, drawAreaY+row*zoom, zoom, zoom, c)
 		}
 	}
 
@@ -592,10 +627,14 @@ func drawPalettePanel(s *gfxState) {
 
 // drawSheetPreview renders the tabbed quadrant preview in the lower-right panel.
 func drawSheetPreview(s *gfxState) {
+	// Pixel-perfect layout: largest integer scale that fits the panel.
+	px, sz, scale := s.previewLayout()
+	tileSz := int32(s.tileSize)
+
 	// ── tabs 1–4 ──────────────────────────────────────────────────────────────
-	tabW := previewSz / 4 // 48
+	tabW := sz / 4
 	for i := range 4 {
-		tx := previewX + int32(i)*tabW
+		tx := px + int32(i)*tabW
 		active := s.activeQuadrant == i
 		var bg rl.Color
 		if active {
@@ -615,13 +654,10 @@ func drawSheetPreview(s *gfxState) {
 		}
 	}
 
-	// ── dynamic quadrant geometry ─────────────────────────────────────────────
-	qSz := s.quadrantSz()   // sheet pixels per quadrant side (e.g. 128 for a 256px sheet)
-	scaleF := s.previewScaleF() // screen pixels per sheet pixel (e.g. 1.5)
-
-	// Q0=top-left, Q1=top-right, Q2=bottom-left, Q3=bottom-right
-	quadOffPxX := 0
-	quadOffPxY := 0
+	// ── quadrant offset in sheet pixels ──────────────────────────────────────
+	qSz := int32(s.quadrantSz())
+	quadOffPxX := int32(0)
+	quadOffPxY := int32(0)
 	switch s.activeQuadrant {
 	case 1:
 		quadOffPxX = qSz
@@ -632,27 +668,36 @@ func drawSheetPreview(s *gfxState) {
 		quadOffPxY = qSz
 	}
 
-	// ── draw the quadrant scaled to previewSz×previewSz ──────────────────────
-	src := rl.NewRectangle(float32(quadOffPxX), float32(quadOffPxY), float32(qSz), float32(qSz))
-	dst := rl.NewRectangle(float32(previewX), float32(previewGridY), float32(previewSz), float32(previewSz))
-	rl.DrawTexturePro(s.tex, src, dst, rl.NewVector2(0, 0), 0, rl.White)
-
-	// ── tile grid overlay ─────────────────────────────────────────────────────
-	tilesInQuad := qSz / s.tileSize
-	gridCol := rl.NewColor(80, 130, 200, 160)
-	for i := 0; i <= tilesInQuad; i++ {
-		x := previewX + int32(float32(i*s.tileSize)*scaleF)
-		rl.DrawLine(x, previewGridY, x, previewGridY+previewSz, gridCol)
-		yy := previewGridY + int32(float32(i*s.tileSize)*scaleF)
-		rl.DrawLine(previewX, yy, previewX+previewSz, yy, gridCol)
+	// ── checkerboard background (same two grays as the tile editor) ───────────
+	const chkSz = int32(6)
+	chk := [2]rl.Color{rl.NewColor(232, 232, 232, 255), rl.NewColor(196, 196, 196, 255)}
+	for cy := int32(0); cy < sz; cy += chkSz {
+		for cx := int32(0); cx < sz; cx += chkSz {
+			rl.DrawRectangle(px+cx, previewGridY+cy, chkSz, chkSz, chk[((cx/chkSz)+(cy/chkSz))%2])
+		}
 	}
 
-	// helper: screen-space tile box at (col, row) within the quadrant
+	// ── draw quadrant at integer scale ────────────────────────────────────────
+	src := rl.NewRectangle(float32(quadOffPxX), float32(quadOffPxY), float32(qSz), float32(qSz))
+	dst := rl.NewRectangle(float32(px), float32(previewGridY), float32(sz), float32(sz))
+	rl.DrawTexturePro(s.tex, src, dst, rl.NewVector2(0, 0), 0, rl.White)
+
+	// ── tile grid overlay (integer positions) ─────────────────────────────────
+	tilesInQuad := int(qSz) / s.tileSize
+	gridCol := rl.NewColor(80, 130, 200, 160)
+	for i := 0; i <= tilesInQuad; i++ {
+		x := px + int32(i)*tileSz*scale
+		rl.DrawLine(x, previewGridY, x, previewGridY+sz, gridCol)
+		yy := previewGridY + int32(i)*tileSz*scale
+		rl.DrawLine(px, yy, px+sz, yy, gridCol)
+	}
+
+	// helper: exact screen rect for a tile at (col, row) within the quadrant.
 	tileBox := func(col, row int) (x, y, w, h int32) {
-		x = previewX + int32(float32(col*s.tileSize)*scaleF)
-		y = previewGridY + int32(float32(row*s.tileSize)*scaleF)
-		w = int32(float32((col+1)*s.tileSize)*scaleF) - (x - previewX)
-		h = int32(float32((row+1)*s.tileSize)*scaleF) - (y - previewGridY)
+		x = px + int32(col)*tileSz*scale
+		y = previewGridY + int32(row)*tileSz*scale
+		w = tileSz * scale
+		h = tileSz * scale
 		return
 	}
 
@@ -660,22 +705,23 @@ func drawSheetPreview(s *gfxState) {
 	mouse := rl.GetMousePosition()
 	mx := int32(mouse.X)
 	my := int32(mouse.Y)
-	if mx >= previewX && mx < previewX+previewSz && my >= previewGridY && my < previewGridY+previewSz {
-		colInQuad := int(float32(mx-previewX)/scaleF) / s.tileSize
-		rowInQuad := int(float32(my-previewGridY)/scaleF) / s.tileSize
+	if mx >= px && mx < px+sz && my >= previewGridY && my < previewGridY+sz {
+		cellSz := tileSz * scale
+		colInQuad := int((mx - px) / cellSz)
+		rowInQuad := int((my - previewGridY) / cellSz)
 
 		hx, hy, hw, hh := tileBox(colInQuad, rowInQuad)
 		rl.DrawRectangleLines(hx, hy, hw, hh, rl.NewColor(255, 255, 100, 200))
 
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-			s.tileX = quadOffPxX/s.tileSize + colInQuad
-			s.tileY = quadOffPxY/s.tileSize + rowInQuad
+			s.tileX = int(quadOffPxX)/s.tileSize + colInQuad
+			s.tileY = int(quadOffPxY)/s.tileSize + rowInQuad
 		}
 	}
 
 	// ── selected tile highlight ───────────────────────────────────────────────
-	quadTileOffX := quadOffPxX / s.tileSize
-	quadTileOffY := quadOffPxY / s.tileSize
+	quadTileOffX := int(quadOffPxX) / s.tileSize
+	quadTileOffY := int(quadOffPxY) / s.tileSize
 	localSelX := s.tileX - quadTileOffX
 	localSelY := s.tileY - quadTileOffY
 	if localSelX >= 0 && localSelX < tilesInQuad && localSelY >= 0 && localSelY < tilesInQuad {
@@ -684,9 +730,8 @@ func drawSheetPreview(s *gfxState) {
 		rl.DrawRectangleLines(hlX, hlY, hlW, hlH, rl.NewColor(0, 0, 0, 180))
 	}
 
-	// ── border around the whole preview ──────────────────────────────────────
-	rl.DrawRectangleLines(previewX-1, previewGridY-1, previewSz+2, previewSz+2,
-		rl.NewColor(60, 60, 60, 255))
+	// ── border around the rendered area ──────────────────────────────────────
+	rl.DrawRectangleLines(px-1, previewGridY-1, sz+2, sz+2, rl.NewColor(60, 60, 60, 255))
 }
 
 func drawStatusBar(s *gfxState) {
@@ -757,6 +802,7 @@ func doSaveImage(s *gfxState, path string) error {
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
 	saveTileMeta(s)
 	refreshFileList(s)
+	s.notify("Saved " + filepath.Base(path))
 	return nil
 }
 
@@ -781,6 +827,7 @@ func confirmNew(s *gfxState) {
 		return
 	}
 	s.switchToImage(path, img)
+	s.notify("Created " + name)
 	s.dialog.active = false
 	s.dialog.filename = ""
 	refreshFileList(s)
@@ -813,6 +860,7 @@ func loadGfxFile(s *gfxState, name string) {
 		return
 	}
 	s.switchToImage(path, img)
+	s.notify("Loaded " + name)
 	refreshFileList(s) // re-sync fileActive to the newly current file
 }
 
@@ -994,21 +1042,25 @@ func drawToolbox(s *gfxState) {
 	// ── Clipboard ──────────────────────────────────────────────────────────────
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_COPY, "")) {
 		s.tileCopy()
+		s.notify("Copied")
 	}
 	tip("Copy (Ctrl+C)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_CUT, "")) {
 		s.tileCut()
+		s.notify("Cut")
 	}
 	tip("Cut (Ctrl+X)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_PASTE, "")) {
 		s.tilePaste()
+		s.notify("Pasted")
 	}
 	tip("Paste (Ctrl+V)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_DELETE, "")) {
 		s.tileClear()
+		s.notify("Cleared")
 	}
 	tip("Delete (Ctrl+D)", x)
 
@@ -1457,4 +1509,27 @@ func drawHelpPage(s *gfxState) {
 
 	drawRows(left, px+12, py+30)
 	drawRows(right, px+pw/2+12, py+30)
+}
+
+// ── toast notification ────────────────────────────────────────────────────────
+
+func drawNotification(s *gfxState) {
+	now := float64(rl.GetTime())
+	if now >= s.toast.until {
+		return
+	}
+	remaining := s.toast.until - now
+	alpha := uint8(255)
+	if remaining < 0.35 {
+		alpha = uint8(remaining / 0.35 * 255)
+	}
+	msg := s.toast.msg
+	tw := rl.MeasureText(msg, 11)
+	pw := tw + 24
+	ph := int32(20)
+	npx := (virtualW - int32(pw)) / 2
+	npy := virtualH - statusBarH - ph - 5
+	rl.DrawRectangle(npx, npy, int32(pw), ph, rl.NewColor(30, 58, 105, alpha))
+	rl.DrawRectangleLines(npx, npy, int32(pw), ph, rl.NewColor(70, 118, 210, alpha))
+	rl.DrawText(msg, npx+12, npy+4, 11, rl.NewColor(220, 235, 255, alpha))
 }
