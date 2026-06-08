@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-//go:embed templates/main.lua templates/conf.lua templates/.gitignore templates/.luarc.json templates/assets/.keep
+//go:embed all:templates
 var templatesFS embed.FS
 
 func main() {
@@ -31,6 +31,10 @@ func main() {
 		err = runWatch()
 	case "clean":
 		err = runClean()
+	case "refresh":
+		err = runRefresh()
+	case "gfx":
+		err = runGfx(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:])
 	case "version", "--version", "-v":
@@ -60,6 +64,8 @@ func printUsage() {
 	fmt.Printf("  %s serve [--port N]  Serve dist/www with the headers required for SharedArrayBuffer (default port 8000)\n", bin)
 	fmt.Printf("  %s run               Launch the game in the current directory with love/love2d\n", bin)
 	fmt.Printf("  %s watch             Watch .lua files and assets/ and auto-restart the game on changes\n", bin)
+	fmt.Printf("  %s refresh            Add missing template files; prompt to replace existing ones\n", bin)
+	fmt.Printf("  %s gfx [file]         Open sprite editor (file resolved under assets/gfx/)\n", bin)
 	fmt.Printf("  %s clean             Remove dist directory\n", bin)
 	fmt.Printf("  %s version           Print version\n", bin)
 }

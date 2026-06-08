@@ -97,38 +97,91 @@ func gatherProjectInfo(defaultTitle string) (projectInfo, error) {
 }
 
 func initializeProject(root string, info projectInfo) error {
-	files := []struct {
-		template string
-		target   string
-	}{
-		{template: "templates/main.lua", target: "main.lua"},
-		{template: "templates/conf.lua", target: "conf.lua"},
-		{template: "templates/.gitignore", target: ".gitignore"},
-		{template: "templates/.luarc.json", target: ".luarc.json"},
-	}
-
-	for _, file := range files {
-		raw, err := templatesFS.ReadFile(file.template)
-		if err != nil {
-			return err
-		}
-
-		contents, err := renderTemplate(raw, info)
-		if err != nil {
-			return fmt.Errorf("render %s: %w", file.template, err)
-		}
-
-		targetPath := filepath.Join(root, file.target)
-		if err := writeIfNotExists(targetPath, contents, 0o644); err != nil {
-			return err
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Join(root, "assets"), 0o755); err != nil {
+	source, cleanup, err := getTemplateFS()
+	if err != nil {
 		return err
 	}
+	defer cleanup()
 
-	return nil
+	return walkTemplates(source, func(relPath string) error {
+		target := filepath.Join(root, filepath.FromSlash(relPath))
+		if filepath.Base(target) == ".keep" {
+			return os.MkdirAll(filepath.Dir(target), 0o755)
+		}
+		raw, err := fs.ReadFile(source, relPath)
+		if err != nil {
+			return err
+		}
+		contents, err := applyTemplate(relPath, raw, info)
+		if err != nil {
+			return fmt.Errorf("render %s: %w", relPath, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return writeIfNotExists(target, contents, 0o644)
+	})
+}
+
+// getTemplateFS resolves the template source in priority order:
+//  1. FZ_TEMPLATE env var pointing to a local directory
+//  2. FZ_TEMPLATE env var containing a git URL (cloned into a temp dir)
+//  3. Embedded templates bundled in the binary
+//
+// The returned cleanup function must be called when the FS is no longer needed.
+func getTemplateFS() (fs.FS, func(), error) {
+	src := os.Getenv("FZ_TEMPLATE")
+	if src == "" {
+		sub, err := fs.Sub(templatesFS, "templates")
+		return sub, func() {}, err
+	}
+
+	// Local directory
+	if info, err := os.Stat(src); err == nil && info.IsDir() {
+		return os.DirFS(src), func() {}, nil
+	}
+
+	// Git URL — clone into a temp dir
+	if _, err := exec.LookPath("git"); err != nil {
+		return nil, func() {}, fmt.Errorf("FZ_TEMPLATE=%q looks like a URL but git is not in PATH", src)
+	}
+	tmpDir, err := os.MkdirTemp("", "fz-template-*")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	cleanup := func() { os.RemoveAll(tmpDir) }
+
+	fmt.Fprintf(os.Stderr, "Cloning template from %s ...\n", src)
+	cmd := exec.Command("git", "clone", "--depth=1", src, tmpDir)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("git clone %s: %w", src, err)
+	}
+	return os.DirFS(tmpDir), cleanup, nil
+}
+
+// walkTemplates calls fn for every file in source, passing the slash-separated
+// path relative to the FS root.
+func walkTemplates(source fs.FS, fn func(relPath string) error) error {
+	return fs.WalkDir(source, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		return fn(path)
+	})
+}
+
+// applyTemplate renders src through Go text/template for the two files that
+// carry project metadata (main.lua, conf.lua). All other files pass through
+// verbatim so third-party libraries are never modified.
+func applyTemplate(relPath string, src []byte, info projectInfo) ([]byte, error) {
+	base := filepath.Base(relPath)
+	if base != "main.lua" && base != "conf.lua" {
+		return src, nil
+	}
+	return renderTemplate(src, info)
 }
 
 func renderTemplate(src []byte, info projectInfo) ([]byte, error) {
