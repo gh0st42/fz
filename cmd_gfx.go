@@ -99,12 +99,22 @@ const (
 	toolEraser
 )
 
+// ── dialog mode ───────────────────────────────────────────────────────────────
+
+type dialogMode int
+
+const (
+	modeSaveAs dialogMode = iota
+	modeNew
+)
+
 // ── state ─────────────────────────────────────────────────────────────────────
 
 var tileSizeCycle = []int{8, 16, 32, 64}
 
 type saveDialog struct {
 	active   bool
+	mode     dialogMode
 	filename string // text being typed (no directory, no extension required)
 }
 
@@ -125,6 +135,12 @@ type gfxState struct {
 	iconCCW        rl.RenderTexture2D // ROTATE_FILL icon pre-rendered for H-flip
 	dialog         saveDialog
 	texDirty       bool // image was modified; texture needs uploading before next draw
+
+	// file switcher dropdown
+	fileList   []string // basenames of .png files found in assets/gfx
+	fileActive int32    // index of currently displayed item in dropdown
+	fileEdit   bool     // true while the dropdown is open
+	fileText   string   // semicolon-joined names passed to raygui
 }
 
 // tileZoom returns the screen pixels per tile pixel for the drawing area.
@@ -162,7 +178,7 @@ func runGfx(args []string) error {
 		return err
 	}
 
-	rl.SetConfigFlags(rl.FlagWindowResizable)
+	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagWindowHighdpi)
 	rl.InitWindow(virtualW*2, virtualH*2, "fz gfx — "+filepath.Base(imgPath))
 	rl.SetTargetFPS(60)
 	defer rl.CloseWindow()
@@ -191,14 +207,22 @@ func runGfx(args []string) error {
 	rl.SetTextureFilter(state.tex, rl.FilterPoint)
 	defer func() { rl.UnloadTexture(state.tex) }()
 
+	refreshFileList(state)
+
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
 
 	for !rl.WindowShouldClose() {
 		scale, offsetX, offsetY := virtualScale()
+		// BeginDrawing() with FLAG_WINDOW_HIGHDPI draws in screen (logical) coords,
+		// but virtualScale() uses render (physical) coords. Convert for draw calls.
+		dpi := float32(rl.GetRenderWidth()) / float32(rl.GetScreenWidth())
+		screenScale := scale / dpi
+		screenOffX := offsetX / dpi
+		screenOffY := offsetY / dpi
 
-		rl.SetMouseOffset(int(-offsetX), int(-offsetY))
-		rl.SetMouseScale(1/scale, 1/scale)
+		rl.SetMouseOffset(int(-screenOffX), int(-screenOffY))
+		rl.SetMouseScale(1/screenScale, 1/screenScale)
 
 		handleGfxInput(state)
 
@@ -219,7 +243,7 @@ func runGfx(args []string) error {
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.Black)
 		src := rl.NewRectangle(0, 0, float32(virtualW), -float32(virtualH))
-		dst := rl.NewRectangle(offsetX, offsetY, float32(virtualW)*scale, float32(virtualH)*scale)
+		dst := rl.NewRectangle(screenOffX, screenOffY, float32(virtualW)*screenScale, float32(virtualH)*screenScale)
 		rl.DrawTexturePro(canvas.Texture, src, dst, rl.NewVector2(0, 0), 0, rl.White)
 		rl.EndDrawing()
 	}
@@ -233,6 +257,9 @@ func handleGfxInput(s *gfxState) {
 	if s.dialog.active {
 		handleDialogInput(s)
 		return
+	}
+	if s.fileEdit {
+		return // dropdown is open; don't forward clicks to canvas or palette
 	}
 
 	mod := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl) ||
@@ -356,7 +383,11 @@ func handleDialogInput(s *gfxState) {
 		s.dialog.filename = string(r[:len(r)-1])
 	}
 	if rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeyKpEnter) {
-		confirmSave(s)
+		if s.dialog.mode == modeNew {
+			confirmNew(s)
+		} else {
+			confirmSave(s)
+		}
 	}
 	if rl.IsKeyPressed(rl.KeyEscape) {
 		s.dialog.active = false
@@ -373,15 +404,43 @@ func drawGfxScene(s *gfxState) {
 	drawPalettePanel(s)
 	drawSheetPreview(s)
 	drawStatusBar(s)
-	drawSaveDialog(s) // modal overlay — drawn last so it sits on top
+	drawSaveDialog(s)      // modal overlay — drawn last so it sits on top
+	drawToolbarDropdown(s) // expanded dropdown must render above all other content
 }
 
 func drawToolbar(s *gfxState) {
 	rl.DrawRectangle(0, 0, virtualW, toolbarH, rl.NewColor(30, 30, 30, 255))
 	rl.DrawLine(0, toolbarH, virtualW, toolbarH, rl.NewColor(60, 60, 60, 255))
 	if !s.dialog.active {
-		if raygui.Button(rl.NewRectangle(4, 4, 52, 20), "Save") {
+		if raygui.Button(rl.NewRectangle(4, 4, 44, 20), "Save") {
 			triggerSave(s)
+		}
+		if raygui.Button(rl.NewRectangle(52, 4, 36, 20), "New") {
+			s.dialog.mode = modeNew
+			s.dialog.filename = ""
+			s.dialog.active = true
+		}
+	}
+}
+
+// drawToolbarDropdown is called at the end of drawGfxScene so the expanded
+// list renders on top of the canvas, tile editor, and other elements.
+func drawToolbarDropdown(s *gfxState) {
+	if s.dialog.active {
+		return
+	}
+	prevEdit := s.fileEdit
+	if raygui.DropdownBox(rl.NewRectangle(92, 4, 170, 20), s.fileText, &s.fileActive, s.fileEdit) {
+		s.fileEdit = !s.fileEdit
+	}
+	switch {
+	case !prevEdit && s.fileEdit:
+		// Dropdown just opened: refresh from disk so the list is always current.
+		refreshFileList(s)
+	case prevEdit && !s.fileEdit && len(s.fileList) > 0:
+		// Dropdown just closed: load the selected file.
+		if int(s.fileActive) < len(s.fileList) {
+			loadGfxFile(s, s.fileList[s.fileActive])
 		}
 	}
 }
@@ -605,6 +664,7 @@ func triggerSave(s *gfxState) {
 	if filepath.Base(s.imgPath) == "new.png" {
 		// No explicit filename was given – ask for one.
 		s.dialog.filename = ""
+		s.dialog.mode = modeSaveAs
 		s.dialog.active = true
 		return
 	}
@@ -641,7 +701,95 @@ func doSaveImage(s *gfxState, path string) error {
 	}
 	s.imgPath = path
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
+	refreshFileList(s)
 	return nil
+}
+
+// confirmNew creates a blank 256×256 sheet with the typed name and switches to it.
+func confirmNew(s *gfxState) {
+	name := strings.TrimSpace(s.dialog.filename)
+	if name == "" {
+		return
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".png") {
+		name += ".png"
+	}
+	path := filepath.Join("assets", "gfx", name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "new:", err)
+		return
+	}
+	img := rl.GenImageColor(256, 256, rl.Blank)
+	rl.ImageFormat(img, rl.UncompressedR8g8b8a8)
+	if !rl.ExportImage(*img, path) {
+		fmt.Fprintln(os.Stderr, "new: could not export", path)
+		return
+	}
+	s.switchToImage(path, img)
+	s.dialog.active = false
+	s.dialog.filename = ""
+	refreshFileList(s)
+}
+
+// switchToImage unloads the current image and texture and loads the given one.
+func (s *gfxState) switchToImage(path string, img *rl.Image) {
+	rl.UnloadImage(s.img)
+	rl.UnloadTexture(s.tex)
+	rl.ImageFormat(img, rl.UncompressedR8g8b8a8)
+	s.img = img
+	s.tex = rl.LoadTextureFromImage(img)
+	rl.SetTextureFilter(s.tex, rl.FilterPoint)
+	s.imgPath = path
+	s.sheetSz = int(img.Width)
+	s.tileX = 0
+	s.tileY = 0
+	s.clipboard = nil
+	s.texDirty = false
+	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
+}
+
+// loadGfxFile loads a PNG from assets/gfx by basename and switches to it.
+func loadGfxFile(s *gfxState, name string) {
+	path := filepath.Join("assets", "gfx", name)
+	img := rl.LoadImage(path)
+	if img == nil {
+		return
+	}
+	s.switchToImage(path, img)
+	refreshFileList(s) // re-sync fileActive to the newly current file
+}
+
+// refreshFileList scans assets/gfx for PNG files and rebuilds the dropdown text.
+// It also updates fileActive to point at the currently open file.
+func refreshFileList(s *gfxState) {
+	dir := filepath.Join("assets", "gfx")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		s.fileList = nil
+		s.fileText = "(empty)"
+		s.fileActive = 0
+		return
+	}
+	s.fileList = nil
+	for _, e := range entries {
+		if !e.IsDir() && strings.ToLower(filepath.Ext(e.Name())) == ".png" {
+			s.fileList = append(s.fileList, e.Name())
+		}
+	}
+	if len(s.fileList) == 0 {
+		s.fileText = "(empty)"
+		s.fileActive = 0
+		return
+	}
+	s.fileText = strings.Join(s.fileList, ";")
+	base := filepath.Base(s.imgPath)
+	s.fileActive = 0
+	for i, f := range s.fileList {
+		if f == base {
+			s.fileActive = int32(i)
+			break
+		}
+	}
 }
 
 // drawSaveDialog renders a modal filename-input dialog when a save-as is needed.
@@ -940,18 +1088,20 @@ func (s *gfxState) tileClear() {
 	s.texDirty = true
 }
 
+// virtualScale returns scale and offsets in physical/render-pixel space.
+// Callers must convert to screen/logical space before passing to draw calls.
 func virtualScale() (scale, offsetX, offsetY float32) {
-	winW := float32(rl.GetScreenWidth())
-	winH := float32(rl.GetScreenHeight())
-	sx := winW / float32(virtualW)
-	sy := winH / float32(virtualH)
+	rw := float32(rl.GetRenderWidth())
+	rh := float32(rl.GetRenderHeight())
+	sx := rw / float32(virtualW)
+	sy := rh / float32(virtualH)
 	if sx < sy {
 		scale = sx
 	} else {
 		scale = sy
 	}
-	offsetX = (winW - float32(virtualW)*scale) / 2
-	offsetY = (winH - float32(virtualH)*scale) / 2
+	offsetX = (rw - float32(virtualW)*scale) / 2
+	offsetY = (rh - float32(virtualH)*scale) / 2
 	return
 }
 
