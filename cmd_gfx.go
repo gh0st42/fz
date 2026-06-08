@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -14,7 +18,7 @@ import (
 
 const (
 	virtualW = int32(640)
-	virtualH = int32(480)
+	virtualH = int32(504) // extra 24px below toolbox for the tile-flags row
 
 	toolbarH   = int32(28)
 	statusBarH = int32(20)
@@ -46,8 +50,11 @@ const (
 	previewGridY = sheetTabY + sheetTabH + 2 // where tiles start: 222
 
 	// Toolbox row below the drawing area
-	toolboxY    = drawAreaY + drawAreaSz + 4 // 420
+	toolboxY     = drawAreaY + drawAreaSz + 4 // 420
 	toolboxBtnSz = int32(24)
+
+	// Tile-flags row below the toolbox
+	flagsRowY = toolboxY + toolboxBtnSz + 6 // 450
 )
 
 // ── palette ───────────────────────────────────────────────────────────────────
@@ -135,6 +142,8 @@ type gfxState struct {
 	iconCCW        rl.RenderTexture2D // ROTATE_FILL icon pre-rendered for H-flip
 	dialog         saveDialog
 	texDirty       bool // image was modified; texture needs uploading before next draw
+	tileFlags      map[int]uint8 // tile index → 8-bit flag mask; zero entries omitted
+	showHelp       bool
 
 	// file switcher dropdown
 	fileList   []string // basenames of .png files found in assets/gfx
@@ -196,18 +205,20 @@ func runGfx(args []string) error {
 	defer rl.UnloadRenderTexture(iconCCW)
 
 	state := &gfxState{
-		imgPath:  imgPath,
-		img:      img,
-		tex:      rl.LoadTextureFromImage(img),
-		tileSize: 16,
-		showGrid: true,
-		sheetSz:  int(img.Width),
-		iconCCW:  iconCCW,
+		imgPath:   imgPath,
+		img:       img,
+		tex:       rl.LoadTextureFromImage(img),
+		tileSize:  16,
+		showGrid:  true,
+		sheetSz:   int(img.Width),
+		iconCCW:   iconCCW,
+		tileFlags: make(map[int]uint8),
 	}
 	rl.SetTextureFilter(state.tex, rl.FilterPoint)
 	defer func() { rl.UnloadTexture(state.tex) }()
 
 	refreshFileList(state)
+	loadTileMeta(state)
 
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
@@ -254,6 +265,12 @@ func runGfx(args []string) error {
 // ── input ─────────────────────────────────────────────────────────────────────
 
 func handleGfxInput(s *gfxState) {
+	if s.showHelp {
+		if rl.IsKeyPressed(rl.KeyF1) || rl.IsKeyPressed(rl.KeyEscape) {
+			s.showHelp = false
+		}
+		return
+	}
 	if s.dialog.active {
 		handleDialogInput(s)
 		return
@@ -285,6 +302,8 @@ func handleGfxInput(s *gfxState) {
 
 	// Plain key shortcuts.
 	switch {
+	case rl.IsKeyPressed(rl.KeyF1):
+		s.showHelp = true
 	case rl.IsKeyPressed(rl.KeyS):
 		for i, sz := range tileSizeCycle {
 			if s.tileSize == sz {
@@ -319,6 +338,39 @@ func handleGfxInput(s *gfxState) {
 		} else {
 			s.tileRotateCW()
 		}
+	// Alt+1..4 → switch sheet quadrant; plain 1..4 fall through to flag-bit toggle.
+	case rl.IsKeyPressed(rl.KeyOne):
+		if alt {
+			s.activeQuadrant = 0
+		} else {
+			s.toggleTileFlag(1)
+		}
+	case rl.IsKeyPressed(rl.KeyTwo):
+		if alt {
+			s.activeQuadrant = 1
+		} else {
+			s.toggleTileFlag(2)
+		}
+	case rl.IsKeyPressed(rl.KeyThree):
+		if alt {
+			s.activeQuadrant = 2
+		} else {
+			s.toggleTileFlag(3)
+		}
+	case rl.IsKeyPressed(rl.KeyFour):
+		if alt {
+			s.activeQuadrant = 3
+		} else {
+			s.toggleTileFlag(4)
+		}
+	case rl.IsKeyPressed(rl.KeyZero):
+		s.toggleTileFlag(0)
+	case rl.IsKeyPressed(rl.KeyFive):
+		s.toggleTileFlag(5)
+	case rl.IsKeyPressed(rl.KeySix):
+		s.toggleTileFlag(6)
+	case rl.IsKeyPressed(rl.KeySeven):
+		s.toggleTileFlag(7)
 	}
 
 	// Palette swatch click.
@@ -401,11 +453,13 @@ func drawGfxScene(s *gfxState) {
 	drawToolbar(s)
 	drawTileEditor(s)
 	drawToolbox(s)
+	drawTileFlags(s)
 	drawPalettePanel(s)
 	drawSheetPreview(s)
 	drawStatusBar(s)
 	drawSaveDialog(s)      // modal overlay — drawn last so it sits on top
 	drawToolbarDropdown(s) // expanded dropdown must render above all other content
+	drawHelpPage(s)        // help overlay is topmost
 }
 
 func drawToolbar(s *gfxState) {
@@ -701,6 +755,7 @@ func doSaveImage(s *gfxState, path string) error {
 	}
 	s.imgPath = path
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
+	saveTileMeta(s)
 	refreshFileList(s)
 	return nil
 }
@@ -745,7 +800,9 @@ func (s *gfxState) switchToImage(path string, img *rl.Image) {
 	s.tileY = 0
 	s.clipboard = nil
 	s.texDirty = false
+	s.tileFlags = make(map[int]uint8)
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
+	loadTileMeta(s)
 }
 
 // loadGfxFile loads a PNG from assets/gfx by basename and switches to it.
@@ -1088,6 +1145,14 @@ func (s *gfxState) tileClear() {
 	s.texDirty = true
 }
 
+func (s *gfxState) toggleTileFlag(bit int) {
+	id := s.tileIndex()
+	s.tileFlags[id] ^= 1 << uint(bit)
+	if s.tileFlags[id] == 0 {
+		delete(s.tileFlags, id)
+	}
+}
+
 // virtualScale returns scale and offsets in physical/render-pixel space.
 // Callers must convert to screen/logical space before passing to draw calls.
 func virtualScale() (scale, offsetX, offsetY float32) {
@@ -1104,6 +1169,200 @@ func virtualScale() (scale, offsetX, offsetY float32) {
 	offsetY = (rh - float32(virtualH)*scale) / 2
 	return
 }
+
+// ── tile metadata (PNG tEXt chunk) ────────────────────────────────────────────
+
+// tileMeta is serialised as JSON into a PNG tEXt chunk with key "fz_meta".
+type tileMeta struct {
+	TileSize int              `json:"tile_size"`
+	Flags    map[string]uint8 `json:"flags,omitempty"` // tile-id string → 8-bit mask
+}
+
+const pngMetaKey = "fz_meta"
+
+// pngChunk holds one parsed PNG chunk.
+type pngChunk struct {
+	typ string
+	raw []byte // full encoded bytes: length(4)+type(4)+data(N)+crc(4)
+	dat []byte // data slice into raw
+}
+
+func makePNGChunk(typ string, data []byte) []byte {
+	out := make([]byte, 12+len(data))
+	binary.BigEndian.PutUint32(out[0:], uint32(len(data)))
+	copy(out[4:], typ)
+	copy(out[8:], data)
+	binary.BigEndian.PutUint32(out[8+len(data):], crc32.Checksum(out[4:8+len(data)], crc32.IEEETable))
+	return out
+}
+
+func parsePNGChunks(buf []byte) ([]pngChunk, error) {
+	if len(buf) < 8 || string(buf[:8]) != "\x89PNG\r\n\x1a\n" {
+		return nil, fmt.Errorf("not a PNG file")
+	}
+	var chunks []pngChunk
+	pos := 8
+	for pos+12 <= len(buf) {
+		n := int(binary.BigEndian.Uint32(buf[pos:]))
+		if pos+12+n > len(buf) {
+			break
+		}
+		c := pngChunk{
+			typ: string(buf[pos+4 : pos+8]),
+			raw: buf[pos : pos+12+n],
+			dat: buf[pos+8 : pos+8+n],
+		}
+		chunks = append(chunks, c)
+		pos += 12 + n
+		if c.typ == "IEND" {
+			break
+		}
+	}
+	return chunks, nil
+}
+
+// isOurTextChunk returns true when c is the tEXt chunk with our metadata key.
+func isOurTextChunk(c pngChunk) bool {
+	if c.typ != "tEXt" {
+		return false
+	}
+	for i, b := range c.dat {
+		if b == 0 {
+			return string(c.dat[:i]) == pngMetaKey
+		}
+	}
+	return false
+}
+
+func readPNGMeta(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	chunks, err := parsePNGChunks(raw)
+	if err != nil {
+		return "", err
+	}
+	for _, c := range chunks {
+		if !isOurTextChunk(c) {
+			continue
+		}
+		for i, b := range c.dat {
+			if b == 0 {
+				return string(c.dat[i+1:]), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func writePNGMeta(path, jsonStr string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	chunks, err := parsePNGChunks(raw)
+	if err != nil {
+		return err
+	}
+	out := []byte("\x89PNG\r\n\x1a\n")
+	for _, c := range chunks {
+		if isOurTextChunk(c) {
+			continue // drop old metadata chunk
+		}
+		if c.typ == "IEND" {
+			// Insert fresh metadata chunk before IEND.
+			cd := append([]byte(pngMetaKey+"\x00"), []byte(jsonStr)...)
+			out = append(out, makePNGChunk("tEXt", cd)...)
+		}
+		out = append(out, c.raw...)
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+func loadTileMeta(s *gfxState) {
+	jsonStr, err := readPNGMeta(s.imgPath)
+	if err != nil || jsonStr == "" {
+		return
+	}
+	var meta tileMeta
+	if err := json.Unmarshal([]byte(jsonStr), &meta); err != nil {
+		return
+	}
+	for _, sz := range tileSizeCycle {
+		if meta.TileSize == sz {
+			s.tileSize = sz
+			break
+		}
+	}
+	for k, v := range meta.Flags {
+		if id, err := strconv.Atoi(k); err == nil && v != 0 {
+			s.tileFlags[id] = v
+		}
+	}
+}
+
+func saveTileMeta(s *gfxState) {
+	flags := make(map[string]uint8)
+	for id, v := range s.tileFlags {
+		if v != 0 {
+			flags[strconv.Itoa(id)] = v
+		}
+	}
+	var flagField map[string]uint8
+	if len(flags) > 0 {
+		flagField = flags
+	}
+	j, err := json.Marshal(tileMeta{TileSize: s.tileSize, Flags: flagField})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "meta:", err)
+		return
+	}
+	if err := writePNGMeta(s.imgPath, string(j)); err != nil {
+		fmt.Fprintln(os.Stderr, "meta:", err)
+	}
+}
+
+// ── tile flags UI ─────────────────────────────────────────────────────────────
+
+func drawTileFlags(s *gfxState) {
+	if s.dialog.active {
+		return
+	}
+	const cbSz = float32(14)
+	const step = float32(34)
+	y := float32(flagsRowY)
+	x := float32(drawAreaX)
+
+	rl.DrawText("FLAGS:", int32(x), int32(y)+2, 10, rl.NewColor(160, 160, 160, 255))
+	x += 50
+
+	tileID := s.tileIndex()
+	flags := s.tileFlags[tileID]
+
+	for bit := 0; bit < 8; bit++ {
+		checked := (flags>>uint(bit))&1 == 1
+		prev := checked
+		raygui.CheckBox(rl.NewRectangle(x, y, cbSz, cbSz), strconv.Itoa(bit), &checked)
+		if checked != prev {
+			if checked {
+				s.tileFlags[tileID] |= 1 << uint(bit)
+			} else {
+				s.tileFlags[tileID] &^= 1 << uint(bit)
+				if s.tileFlags[tileID] == 0 {
+					delete(s.tileFlags, tileID)
+				}
+			}
+		}
+		x += step
+	}
+
+	current := s.tileFlags[tileID]
+	rl.DrawText(fmt.Sprintf("= 0x%02X", current),
+		int32(x)+4, int32(y)+2, 10, rl.NewColor(130, 180, 130, 255))
+}
+
+// ── resolve image path ────────────────────────────────────────────────────────
 
 func resolveGfxImage(filename string) (path string, img *rl.Image, err error) {
 	if filename == "" {
@@ -1129,4 +1388,73 @@ func resolveGfxImage(filename string) (path string, img *rl.Image, err error) {
 		return path, nil, fmt.Errorf("could not load image: %s", path)
 	}
 	return path, img, nil
+}
+
+// ── help overlay ──────────────────────────────────────────────────────────────
+
+func drawHelpPage(s *gfxState) {
+	if !s.showHelp {
+		return
+	}
+	rl.DrawRectangle(0, 0, virtualW, virtualH, rl.NewColor(0, 0, 0, 195))
+
+	const pw, ph = int32(560), int32(268)
+	px := (virtualW - pw) / 2
+	py := (virtualH - ph) / 2
+
+	rl.DrawRectangle(px, py, pw, ph, rl.NewColor(22, 22, 30, 255))
+	rl.DrawRectangleLines(px, py, pw, ph, rl.NewColor(80, 100, 165, 255))
+	rl.DrawLine(px, py+22, px+pw, py+22, rl.NewColor(55, 65, 110, 255))
+	rl.DrawLine(px+pw/2, py+28, px+pw/2, py+ph-6, rl.NewColor(50, 60, 100, 255))
+
+	title := "Keyboard Shortcuts  —  F1 or Esc to close"
+	tw := rl.MeasureText(title, 11)
+	rl.DrawText(title, px+(pw-tw)/2, py+5, 11, rl.NewColor(190, 205, 240, 255))
+
+	type row struct{ key, desc string }
+	left := []row{
+		{"Ctrl+S", "Save"},
+		{"F1", "Toggle this help"},
+		{},
+		{"P", "Pencil tool"},
+		{"F", "Bucket fill"},
+		{"E", "Eraser"},
+		{},
+		{"H", "Flip horizontal"},
+		{"V", "Flip vertical"},
+		{"R", "Rotate CW"},
+		{"Alt+R", "Rotate CCW"},
+	}
+	right := []row{
+		{"Ctrl+C", "Copy tile"},
+		{"Ctrl+X", "Cut tile"},
+		{"Ctrl+V", "Paste tile"},
+		{"Ctrl+D", "Clear tile"},
+		{},
+		{"G", "Toggle grid"},
+		{"+", "Toggle symmetry"},
+		{"S", "Cycle tile size"},
+		{},
+		{"Alt+1..4", "Switch sheet page"},
+		{"0..7", "Toggle flag bit"},
+	}
+
+	kCol := rl.NewColor(215, 225, 100, 255)
+	dCol := rl.NewColor(175, 175, 188, 255)
+
+	drawRows := func(rows []row, startX, startY int32) {
+		cy := startY
+		for _, r := range rows {
+			if r.key == "" {
+				cy += 7
+				continue
+			}
+			rl.DrawText(r.key, startX, cy, 10, kCol)
+			rl.DrawText(r.desc, startX+86, cy, 10, dCol)
+			cy += 15
+		}
+	}
+
+	drawRows(left, px+12, py+30)
+	drawRows(right, px+pw/2+12, py+30)
 }
