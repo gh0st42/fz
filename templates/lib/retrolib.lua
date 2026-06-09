@@ -240,6 +240,70 @@ function retrolib.pal_vga(idx)
   return { 0, 0, 0, 1 }
 end
 
+-- ─── Tile flags (fz_meta PNG chunk) ──────────────────────────────────────────
+-- fz sprite sheets embed a tEXt chunk with keyword "fz_meta" containing JSON:
+--   {"tile_size":16,"flags":{"0":2,"5":1,...}}
+-- Keys are 0-based tile indices (strings); values are uint8 bitmasks (0-255).
+
+local _json = (function()
+  local ok, m = pcall(require, "lib.3pp.json")
+  return ok and m or nil
+end)()
+
+local function _u32be(s, i)
+  return string.byte(s, i)   * 0x1000000
+       + string.byte(s, i+1) * 0x10000
+       + string.byte(s, i+2) * 0x100
+       + string.byte(s, i+3)
+end
+
+--- Reads tile-flag metadata from a PNG file produced by `fz gfx`.
+-- path is a love.filesystem path (e.g. "assets/gfx/tiles.png").
+-- Returns { tile_size=N, flags={[tile_id]=bitmask, ...} } or nil on failure.
+-- Tile IDs are 0-based numbers; bitmask is 0–255.
+function retrolib.load_tile_meta(path)
+  assert(_json, "retrolib.load_tile_meta requires lib/3pp/json.lua")
+  local data = love.filesystem.read(path)
+  if not data or #data < 8 then return nil end
+  if data:sub(1, 8) ~= "\137PNG\r\n\26\n" then return nil end
+
+  local pos = 9
+  while pos + 11 <= #data do
+    local len   = _u32be(data, pos)
+    local ctype = data:sub(pos + 4, pos + 7)
+    if pos + 8 + len > #data then break end
+    if ctype == "tEXt" then
+      local cdata = data:sub(pos + 8, pos + 8 + len - 1)
+      local sep   = cdata:find("\0", 1, true)
+      if sep and cdata:sub(1, sep - 1) == "fz_meta" then
+        local ok, meta = pcall(_json.decode, cdata:sub(sep + 1))
+        if ok and type(meta) == "table" then
+          local flags = {}
+          if type(meta.flags) == "table" then
+            for k, v in pairs(meta.flags) do
+              flags[tonumber(k)] = v
+            end
+          end
+          return { tile_size = meta.tile_size or 16, flags = flags }
+        end
+      end
+    end
+    pos = pos + 4 + 4 + len + 4
+    if ctype == "IEND" then break end
+  end
+  return nil
+end
+
+--- Returns true if tile tile_id has flag bit bit_index set.
+-- meta is the table returned by load_tile_meta().
+-- tile_id is 0-based; bit_index is 0–7 (0 = least-significant bit).
+-- Mirrors the PICO-8 fget(n, f) API.
+function retrolib.fget(meta, tile_id, bit_index)
+  if not meta or not meta.flags then return false end
+  local mask = meta.flags[tile_id] or 0
+  return math.floor(mask / (2 ^ bit_index)) % 2 == 1
+end
+
 -- ─── Lifecycle / main loop ────────────────────────────────────────────────────
 
 local function _init_graphics()

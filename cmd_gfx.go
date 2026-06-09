@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/gen2brain/raylib-go/raygui"
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -116,6 +117,16 @@ const (
 	modeNew
 )
 
+// ── undo / redo ───────────────────────────────────────────────────────────────
+
+const maxUndoSteps = 10
+
+// gfxSnapshot is a full copy of the tilesheet pixel data and tile flags.
+type gfxSnapshot struct {
+	pixels    []byte
+	tileFlags map[int]uint8
+}
+
 // ── state ─────────────────────────────────────────────────────────────────────
 
 var tileSizeCycle = []int{8, 16, 32, 64}
@@ -150,6 +161,8 @@ type gfxState struct {
 	wantQuit       bool
 	toast        Toast
 	exitConfirm  ConfirmDialog
+	undoStack    []gfxSnapshot
+	redoStack    []gfxSnapshot
 
 	// file switcher dropdown
 	fileList   []string // basenames of .png files found in assets/gfx
@@ -204,6 +217,68 @@ func (s *gfxState) markDirty() {
 		s.dirty = true
 		rl.SetWindowTitle("fz gfx — " + filepath.Base(s.imgPath) + " *")
 	}
+}
+
+func (s *gfxState) takeSnapshot() gfxSnapshot {
+	sz := int(s.img.Width) * int(s.img.Height) * 4 // RGBA8: 4 bytes per pixel
+	src := unsafe.Slice((*byte)(s.img.Data), sz)
+	px := make([]byte, sz)
+	copy(px, src)
+	flags := make(map[int]uint8, len(s.tileFlags))
+	for k, v := range s.tileFlags {
+		flags[k] = v
+	}
+	return gfxSnapshot{pixels: px, tileFlags: flags}
+}
+
+func (s *gfxState) applySnapshot(snap gfxSnapshot) {
+	sz := int(s.img.Width) * int(s.img.Height) * 4
+	if len(snap.pixels) != sz {
+		return
+	}
+	dst := unsafe.Slice((*byte)(s.img.Data), sz)
+	copy(dst, snap.pixels)
+	s.tileFlags = make(map[int]uint8, len(snap.tileFlags))
+	for k, v := range snap.tileFlags {
+		s.tileFlags[k] = v
+	}
+	s.texDirty = true
+}
+
+func (s *gfxState) pushUndo() {
+	s.undoStack = append(s.undoStack, s.takeSnapshot())
+	if len(s.undoStack) > maxUndoSteps {
+		s.undoStack = s.undoStack[1:]
+	}
+	s.redoStack = s.redoStack[:0]
+}
+
+func (s *gfxState) gfxUndo() {
+	if len(s.undoStack) == 0 {
+		return
+	}
+	s.redoStack = append(s.redoStack, s.takeSnapshot())
+	if len(s.redoStack) > maxUndoSteps {
+		s.redoStack = s.redoStack[1:]
+	}
+	snap := s.undoStack[len(s.undoStack)-1]
+	s.undoStack = s.undoStack[:len(s.undoStack)-1]
+	s.applySnapshot(snap)
+	s.markDirty()
+}
+
+func (s *gfxState) gfxRedo() {
+	if len(s.redoStack) == 0 {
+		return
+	}
+	s.undoStack = append(s.undoStack, s.takeSnapshot())
+	if len(s.undoStack) > maxUndoSteps {
+		s.undoStack = s.undoStack[1:]
+	}
+	snap := s.redoStack[len(s.redoStack)-1]
+	s.redoStack = s.redoStack[:len(s.redoStack)-1]
+	s.applySnapshot(snap)
+	s.markDirty()
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -338,11 +413,21 @@ func handleGfxInput(s *gfxState) {
 		rl.IsKeyDown(rl.KeyLeftSuper) || rl.IsKeyDown(rl.KeyRightSuper)
 	alt := rl.IsKeyDown(rl.KeyLeftAlt) || rl.IsKeyDown(rl.KeyRightAlt)
 
+	shift := rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift)
+
 	// Ctrl/Cmd shortcuts – always handled first, always return early.
 	if mod {
 		switch {
 		case rl.IsKeyPressed(rl.KeyS):
 			triggerSave(s)
+		case rl.IsKeyPressed(rl.KeyZ):
+			if shift {
+				s.gfxRedo()
+			} else {
+				s.gfxUndo()
+			}
+		case rl.IsKeyPressed(rl.KeyY):
+			s.gfxRedo()
 		case rl.IsKeyPressed(rl.KeyC):
 			s.tileCopy()
 			s.toast.Notify("Copied")
@@ -463,6 +548,11 @@ func handleGfxInput(s *gfxState) {
 		imgX := int32(s.tileX*s.tileSize) + pixX
 		imgY := int32(s.tileY*s.tileSize) + pixY
 
+		// Push one undo entry at the start of each pencil/eraser stroke.
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) &&
+			(s.activeTool == toolPencil || s.activeTool == toolEraser) {
+			s.pushUndo()
+		}
 		if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
 			switch s.activeTool {
 			case toolPencil:
@@ -891,6 +981,8 @@ func (s *gfxState) switchToImage(path string, img *rl.Image) {
 	s.texDirty = false
 	s.dirty = false
 	s.tileFlags = make(map[int]uint8)
+	s.undoStack = s.undoStack[:0]
+	s.redoStack = s.redoStack[:0]
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
 	loadTileMeta(s)
 }
@@ -1136,6 +1228,7 @@ func drawToolTip(text string, mx, my float32) {
 // tileTransform applies an in-place pixel permutation to the current tile.
 // fn(dstCol, dstRow, sz) returns the (srcCol, srcRow) that maps to that destination.
 func (s *gfxState) tileTransform(fn func(col, row, sz int) (int, int)) {
+	s.pushUndo()
 	sz := s.tileSize
 	ox, oy := s.tileX*sz, s.tileY*sz
 	buf := make([]rl.Color, sz*sz)
@@ -1179,6 +1272,7 @@ func (s *gfxState) tileFill(startX, startY int32) {
 	if target == fill {
 		return
 	}
+	s.pushUndo()
 	minX := int32(s.tileX * s.tileSize)
 	minY := int32(s.tileY * s.tileSize)
 	sz := int32(s.tileSize)
@@ -1221,6 +1315,7 @@ func (s *gfxState) tilePaste() {
 	if len(s.clipboard) != s.tileSize*s.tileSize {
 		return
 	}
+	s.pushUndo()
 	sz := s.tileSize
 	ox, oy := s.tileX*sz, s.tileY*sz
 	for row := range sz {
@@ -1239,6 +1334,7 @@ func (s *gfxState) tilePaste() {
 }
 
 func (s *gfxState) tileClear() {
+	s.pushUndo()
 	sz := s.tileSize
 	ox, oy := s.tileX*sz, s.tileY*sz
 	blank := rl.NewColor(0, 0, 0, 0)
@@ -1253,6 +1349,7 @@ func (s *gfxState) tileClear() {
 }
 
 func (s *gfxState) toggleTileFlag(bit int) {
+	s.pushUndo()
 	id := s.tileIndex()
 	s.tileFlags[id] ^= 1 << uint(bit)
 	if s.tileFlags[id] == 0 {
@@ -1343,6 +1440,7 @@ func drawTileFlags(s *gfxState) {
 		prev := checked
 		raygui.CheckBox(rl.NewRectangle(x, y, cbSz, cbSz), strconv.Itoa(bit), &checked)
 		if checked != prev {
+			s.pushUndo()
 			if checked {
 				s.tileFlags[tileID] |= 1 << uint(bit)
 			} else {
@@ -1409,6 +1507,8 @@ func drawHelpPage(s *gfxState) {
 	type row struct{ key, desc string }
 	left := []row{
 		{"Ctrl+S", "Save"},
+		{"Ctrl+Z", "Undo"},
+		{"Ctrl+Y / Ctrl+Shift+Z", "Redo"},
 		{"F1", "Toggle this help"},
 		{},
 		{"P", "Pencil tool"},

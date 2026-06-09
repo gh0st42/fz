@@ -39,8 +39,9 @@ type tiledTilesetRefJSON struct {
 	Source   string `json:"source"`
 }
 
-// mapObject represents a Tiled rect object (or best-effort other types).
-// Unknown fields in loaded TMJ are discarded on re-save.
+// mapObject represents any Tiled object. Known fields are decoded into typed
+// fields; everything else (polygon, polyline, text, gid, class, template, …)
+// is captured in Extras and round-tripped verbatim.
 type mapObject struct {
 	ID         int             `json:"id"`
 	Name       string          `json:"name"`
@@ -54,6 +55,54 @@ type mapObject struct {
 	Ellipse    bool            `json:"ellipse,omitempty"`
 	Point      bool            `json:"point,omitempty"`
 	Properties []tiledProperty `json:"properties,omitempty"`
+	Extras     map[string]json.RawMessage `json:"-"`
+}
+
+var knownObjectFields = map[string]bool{
+	"id": true, "name": true, "type": true, "x": true, "y": true,
+	"width": true, "height": true, "rotation": true, "visible": true,
+	"ellipse": true, "point": true, "properties": true,
+}
+
+func (o *mapObject) UnmarshalJSON(data []byte) error {
+	type plain mapObject
+	if err := json.Unmarshal(data, (*plain)(o)); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for k, v := range raw {
+		if !knownObjectFields[k] {
+			if o.Extras == nil {
+				o.Extras = make(map[string]json.RawMessage)
+			}
+			o.Extras[k] = v
+		}
+	}
+	return nil
+}
+
+func (o mapObject) MarshalJSON() ([]byte, error) {
+	type plain mapObject
+	data, err := json.Marshal(plain(o))
+	if err != nil {
+		return nil, err
+	}
+	if len(o.Extras) == 0 {
+		return data, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range o.Extras {
+		if _, exists := m[k]; !exists {
+			m[k] = v
+		}
+	}
+	return json.Marshal(m)
 }
 
 type tiledLayerJSON struct {
