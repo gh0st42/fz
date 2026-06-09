@@ -1,10 +1,8 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -148,10 +146,10 @@ type gfxState struct {
 	texDirty       bool          // image was modified; texture needs uploading before next draw
 	tileFlags      map[int]uint8 // tile index → 8-bit flag mask; zero entries omitted
 	showHelp       bool
-	toast          struct {
-		msg   string
-		until float64
-	}
+	dirty          bool
+	wantQuit       bool
+	toast        Toast
+	exitConfirm  ConfirmDialog
 
 	// file switcher dropdown
 	fileList   []string // basenames of .png files found in assets/gfx
@@ -201,9 +199,11 @@ func (s *gfxState) previewScaleF() float32 {
 	return float32(scale)
 }
 
-func (s *gfxState) notify(msg string) {
-	s.toast.msg = msg
-	s.toast.until = float64(rl.GetTime()) + 1.6
+func (s *gfxState) markDirty() {
+	if !s.dirty {
+		s.dirty = true
+		rl.SetWindowTitle("fz gfx — " + filepath.Base(s.imgPath) + " *")
+	}
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -258,7 +258,20 @@ func runGfx(args []string) error {
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
 
-	for !rl.WindowShouldClose() {
+	rl.SetExitKey(0)
+	running := true
+	osClosed := false
+
+	for running {
+		if rl.WindowShouldClose() && !osClosed {
+			osClosed = true
+			if state.dirty {
+				state.exitConfirm.Show("Unsaved changes — quit anyway?", "Quit", "Cancel")
+			} else {
+				running = false
+			}
+		}
+
 		scale, offsetX, offsetY := virtualScale()
 		// BeginDrawing() with FLAG_WINDOW_HIGHDPI draws in screen (logical) coords,
 		// but virtualScale() uses render (physical) coords. Convert for draw calls.
@@ -282,6 +295,10 @@ func runGfx(args []string) error {
 		rl.BeginTextureMode(canvas)
 		drawGfxScene(state)
 		rl.EndTextureMode()
+
+		if state.wantQuit {
+			running = false
+		}
 
 		rl.SetMouseOffset(0, 0)
 		rl.SetMouseScale(1, 1)
@@ -310,6 +327,9 @@ func handleGfxInput(s *gfxState) {
 		handleDialogInput(s)
 		return
 	}
+	if s.exitConfirm.Active {
+		return
+	}
 	if s.fileEdit {
 		return // dropdown is open; don't forward clicks to canvas or palette
 	}
@@ -325,16 +345,16 @@ func handleGfxInput(s *gfxState) {
 			triggerSave(s)
 		case rl.IsKeyPressed(rl.KeyC):
 			s.tileCopy()
-			s.notify("Copied")
+			s.toast.Notify("Copied")
 		case rl.IsKeyPressed(rl.KeyX):
 			s.tileCut()
-			s.notify("Cut")
+			s.toast.Notify("Cut")
 		case rl.IsKeyPressed(rl.KeyV):
 			s.tilePaste()
-			s.notify("Pasted")
+			s.toast.Notify("Pasted")
 		case rl.IsKeyPressed(rl.KeyD):
 			s.tileClear()
-			s.notify("Cleared")
+			s.toast.Notify("Cleared")
 		}
 		return
 	}
@@ -410,6 +430,12 @@ func handleGfxInput(s *gfxState) {
 		s.toggleTileFlag(6)
 	case rl.IsKeyPressed(rl.KeySeven):
 		s.toggleTileFlag(7)
+	case rl.IsKeyPressed(rl.KeyEscape):
+		if s.dirty {
+			s.exitConfirm.Show("Unsaved changes — quit anyway?", "Quit", "Cancel")
+		} else {
+			s.wantQuit = true
+		}
 	}
 
 	// Palette swatch click.
@@ -442,9 +468,11 @@ func handleGfxInput(s *gfxState) {
 			case toolPencil:
 				rl.ImageDrawPixel(s.img, imgX, imgY, picotronPalette[s.selectedColor])
 				s.texDirty = true
+				s.markDirty()
 			case toolEraser:
 				rl.ImageDrawPixel(s.img, imgX, imgY, rl.NewColor(0, 0, 0, 0))
 				s.texDirty = true
+				s.markDirty()
 			case toolBucket:
 				if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 					s.tileFill(imgX, imgY)
@@ -500,7 +528,10 @@ func drawGfxScene(s *gfxState) {
 	drawSaveDialog(s)      // modal overlay — drawn last so it sits on top
 	drawToolbarDropdown(s) // expanded dropdown must render above all other content
 	drawHelpPage(s)        // help overlay is topmost
-	drawNotification(s)    // transient toast is always on top
+	s.toast.Draw()
+	if s.exitConfirm.Draw() {
+		s.wantQuit = true
+	}
 }
 
 func drawToolbar(s *gfxState) {
@@ -809,10 +840,11 @@ func doSaveImage(s *gfxState, path string) error {
 		return fmt.Errorf("could not export %s", path)
 	}
 	s.imgPath = path
+	s.dirty = false
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
 	saveTileMeta(s)
 	refreshFileList(s)
-	s.notify("Saved " + filepath.Base(path))
+	s.toast.Notify("Saved " + filepath.Base(path))
 	return nil
 }
 
@@ -837,7 +869,7 @@ func confirmNew(s *gfxState) {
 		return
 	}
 	s.switchToImage(path, img)
-	s.notify("Created " + name)
+	s.toast.Notify("Created " + name)
 	s.dialog.active = false
 	s.dialog.filename = ""
 	refreshFileList(s)
@@ -857,6 +889,7 @@ func (s *gfxState) switchToImage(path string, img *rl.Image) {
 	s.tileY = 0
 	s.clipboard = nil
 	s.texDirty = false
+	s.dirty = false
 	s.tileFlags = make(map[int]uint8)
 	rl.SetWindowTitle("fz gfx — " + filepath.Base(path))
 	loadTileMeta(s)
@@ -870,7 +903,7 @@ func loadGfxFile(s *gfxState, name string) {
 		return
 	}
 	s.switchToImage(path, img)
-	s.notify("Loaded " + name)
+	s.toast.Notify("Loaded " + name)
 	refreshFileList(s) // re-sync fileActive to the newly current file
 }
 
@@ -1052,25 +1085,25 @@ func drawToolbox(s *gfxState) {
 	// ── Clipboard ──────────────────────────────────────────────────────────────
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_COPY, "")) {
 		s.tileCopy()
-		s.notify("Copied")
+		s.toast.Notify("Copied")
 	}
 	tip("Copy (Ctrl+C)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_CUT, "")) {
 		s.tileCut()
-		s.notify("Cut")
+		s.toast.Notify("Cut")
 	}
 	tip("Cut (Ctrl+X)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_PASTE, "")) {
 		s.tilePaste()
-		s.notify("Pasted")
+		s.toast.Notify("Pasted")
 	}
 	tip("Paste (Ctrl+V)", x)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y, bsz, bsz), raygui.IconText(raygui.ICON_FILE_DELETE, "")) {
 		s.tileClear()
-		s.notify("Cleared")
+		s.toast.Notify("Cleared")
 	}
 	tip("Delete (Ctrl+D)", x)
 
@@ -1118,6 +1151,7 @@ func (s *gfxState) tileTransform(fn func(col, row, sz int) (int, int)) {
 		}
 	}
 	s.texDirty = true
+	s.markDirty()
 }
 
 func (s *gfxState) tileFlipH() {
@@ -1163,6 +1197,7 @@ func (s *gfxState) tileFill(startX, startY int32) {
 		queue = append(queue, pt{p.x - 1, p.y}, pt{p.x + 1, p.y}, pt{p.x, p.y - 1}, pt{p.x, p.y + 1})
 	}
 	s.texDirty = true
+	s.markDirty()
 }
 
 func (s *gfxState) tileCopy() {
@@ -1200,6 +1235,7 @@ func (s *gfxState) tilePaste() {
 		delete(s.tileFlags, id)
 	}
 	s.texDirty = true
+	s.markDirty()
 }
 
 func (s *gfxState) tileClear() {
@@ -1213,6 +1249,7 @@ func (s *gfxState) tileClear() {
 	}
 	delete(s.tileFlags, s.tileIndex())
 	s.texDirty = true
+	s.markDirty()
 }
 
 func (s *gfxState) toggleTileFlag(bit int) {
@@ -1221,6 +1258,7 @@ func (s *gfxState) toggleTileFlag(bit int) {
 	if s.tileFlags[id] == 0 {
 		delete(s.tileFlags, id)
 	}
+	s.markDirty()
 }
 
 // virtualScale returns scale and offsets in physical/render-pixel space.
@@ -1238,116 +1276,6 @@ func virtualScale() (scale, offsetX, offsetY float32) {
 	offsetX = (rw - float32(virtualW)*scale) / 2
 	offsetY = (rh - float32(virtualH)*scale) / 2
 	return
-}
-
-// ── tile metadata (PNG tEXt chunk) ────────────────────────────────────────────
-
-// tileMeta is serialised as JSON into a PNG tEXt chunk with key "fz_meta".
-type tileMeta struct {
-	TileSize int              `json:"tile_size"`
-	Flags    map[string]uint8 `json:"flags,omitempty"` // tile-id string → 8-bit mask
-}
-
-const pngMetaKey = "fz_meta"
-
-// pngChunk holds one parsed PNG chunk.
-type pngChunk struct {
-	typ string
-	raw []byte // full encoded bytes: length(4)+type(4)+data(N)+crc(4)
-	dat []byte // data slice into raw
-}
-
-func makePNGChunk(typ string, data []byte) []byte {
-	out := make([]byte, 12+len(data))
-	binary.BigEndian.PutUint32(out[0:], uint32(len(data)))
-	copy(out[4:], typ)
-	copy(out[8:], data)
-	binary.BigEndian.PutUint32(out[8+len(data):], crc32.Checksum(out[4:8+len(data)], crc32.IEEETable))
-	return out
-}
-
-func parsePNGChunks(buf []byte) ([]pngChunk, error) {
-	if len(buf) < 8 || string(buf[:8]) != "\x89PNG\r\n\x1a\n" {
-		return nil, fmt.Errorf("not a PNG file")
-	}
-	var chunks []pngChunk
-	pos := 8
-	for pos+12 <= len(buf) {
-		n := int(binary.BigEndian.Uint32(buf[pos:]))
-		if pos+12+n > len(buf) {
-			break
-		}
-		c := pngChunk{
-			typ: string(buf[pos+4 : pos+8]),
-			raw: buf[pos : pos+12+n],
-			dat: buf[pos+8 : pos+8+n],
-		}
-		chunks = append(chunks, c)
-		pos += 12 + n
-		if c.typ == "IEND" {
-			break
-		}
-	}
-	return chunks, nil
-}
-
-// isOurTextChunk returns true when c is the tEXt chunk with our metadata key.
-func isOurTextChunk(c pngChunk) bool {
-	if c.typ != "tEXt" {
-		return false
-	}
-	for i, b := range c.dat {
-		if b == 0 {
-			return string(c.dat[:i]) == pngMetaKey
-		}
-	}
-	return false
-}
-
-func readPNGMeta(path string) (string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	chunks, err := parsePNGChunks(raw)
-	if err != nil {
-		return "", err
-	}
-	for _, c := range chunks {
-		if !isOurTextChunk(c) {
-			continue
-		}
-		for i, b := range c.dat {
-			if b == 0 {
-				return string(c.dat[i+1:]), nil
-			}
-		}
-	}
-	return "", nil
-}
-
-func writePNGMeta(path, jsonStr string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	chunks, err := parsePNGChunks(raw)
-	if err != nil {
-		return err
-	}
-	out := []byte("\x89PNG\r\n\x1a\n")
-	for _, c := range chunks {
-		if isOurTextChunk(c) {
-			continue // drop old metadata chunk
-		}
-		if c.typ == "IEND" {
-			// Insert fresh metadata chunk before IEND.
-			cd := append([]byte(pngMetaKey+"\x00"), []byte(jsonStr)...)
-			out = append(out, makePNGChunk("tEXt", cd)...)
-		}
-		out = append(out, c.raw...)
-	}
-	return os.WriteFile(path, out, 0o644)
 }
 
 func loadTileMeta(s *gfxState) {
@@ -1423,6 +1351,7 @@ func drawTileFlags(s *gfxState) {
 					delete(s.tileFlags, tileID)
 				}
 			}
+			s.markDirty()
 		}
 		x += step
 	}
@@ -1525,25 +1454,3 @@ func drawHelpPage(s *gfxState) {
 	drawRows(right, px+pw/2+12, py+30)
 }
 
-// ── toast notification ────────────────────────────────────────────────────────
-
-func drawNotification(s *gfxState) {
-	now := float64(rl.GetTime())
-	if now >= s.toast.until {
-		return
-	}
-	remaining := s.toast.until - now
-	alpha := uint8(255)
-	if remaining < 0.35 {
-		alpha = uint8(remaining / 0.35 * 255)
-	}
-	msg := s.toast.msg
-	tw := rl.MeasureText(msg, 11)
-	pw := tw + 24
-	ph := int32(20)
-	npx := (virtualW - int32(pw)) / 2
-	npy := virtualH - statusBarH - ph - 5
-	rl.DrawRectangle(npx, npy, int32(pw), ph, rl.NewColor(30, 58, 105, alpha))
-	rl.DrawRectangleLines(npx, npy, int32(pw), ph, rl.NewColor(70, 118, 210, alpha))
-	rl.DrawText(msg, npx+12, npy+4, 11, rl.NewColor(220, 235, 255, alpha))
-}

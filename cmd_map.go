@@ -37,91 +37,6 @@ const (
 	mapBelowBtnH    = int32(20)                            // 434+20=454 → 6px gap to statusBar
 )
 
-// ── Tiled JSON types ──────────────────────────────────────────────────────────
-
-type tiledTileData struct {
-	ID         int             `json:"id"`
-	Properties []tiledProperty `json:"properties,omitempty"`
-}
-
-type tiledTilesetJSON struct {
-	Columns      int              `json:"columns"`
-	Image        string           `json:"image"`
-	ImageHeight  int              `json:"imageheight"`
-	ImageWidth   int              `json:"imagewidth"`
-	Margin       int              `json:"margin"`
-	Name         string           `json:"name"`
-	Spacing      int              `json:"spacing"`
-	TileCount    int              `json:"tilecount"`
-	TileHeight   int              `json:"tileheight"`
-	TileWidth    int              `json:"tilewidth"`
-	Tiles        []tiledTileData  `json:"tiles,omitempty"`
-	Type         string           `json:"type"`
-	Version      string           `json:"version"`
-	TiledVersion string           `json:"tiledversion"`
-}
-
-type tiledProperty struct {
-	Name  string          `json:"name"`
-	Type  string          `json:"type"`
-	Value json.RawMessage `json:"value"`
-}
-
-// mapObject represents a Tiled rect object (or best-effort other types).
-// Unknown fields in loaded TMJ are discarded on re-save.
-type mapObject struct {
-	ID         int              `json:"id"`
-	Name       string           `json:"name"`
-	ObjType    string           `json:"type,omitempty"`
-	X          float64          `json:"x"`
-	Y          float64          `json:"y"`
-	Width      float64          `json:"width"`
-	Height     float64          `json:"height"`
-	Rotation   float64          `json:"rotation,omitempty"`
-	Visible    bool             `json:"visible"`
-	Ellipse    bool             `json:"ellipse,omitempty"`
-	Point      bool             `json:"point,omitempty"`
-	Properties []tiledProperty  `json:"properties,omitempty"`
-}
-
-type tiledLayerJSON struct {
-	Data      []uint32      `json:"data,omitempty"`
-	DrawOrder string        `json:"draworder,omitempty"`
-	Height    int           `json:"height,omitempty"`
-	ID        int           `json:"id"`
-	Name      string        `json:"name"`
-	Objects   *[]mapObject  `json:"objects,omitempty"`
-	Opacity   float64       `json:"opacity"`
-	Type      string        `json:"type"`
-	Visible   bool          `json:"visible"`
-	Width     int           `json:"width,omitempty"`
-	X         int           `json:"x"`
-	Y         int           `json:"y"`
-}
-
-type tiledTilesetRefJSON struct {
-	FirstGID int    `json:"firstgid"`
-	Source   string `json:"source"`
-}
-
-type tiledMapJSON struct {
-	CompressionLevel int                   `json:"compressionlevel"`
-	Height           int                   `json:"height"`
-	Infinite         bool                  `json:"infinite"`
-	Layers           []tiledLayerJSON      `json:"layers"`
-	NextLayerID      int                   `json:"nextlayerid"`
-	NextObjectID     int                   `json:"nextobjectid"`
-	Orientation      string                `json:"orientation"`
-	RenderOrder      string                `json:"renderorder"`
-	TiledVersion     string                `json:"tiledversion"`
-	TileHeight       int                   `json:"tileheight"`
-	TileWidth        int                   `json:"tilewidth"`
-	Tilesets         []tiledTilesetRefJSON `json:"tilesets"`
-	Type             string                `json:"type"`
-	Version          string                `json:"version"`
-	Width            int                   `json:"width"`
-}
-
 // ── layer kind ────────────────────────────────────────────────────────────────
 
 type layerKind int
@@ -331,16 +246,35 @@ type mapState struct {
 	// Layer double-click rename
 	layerLastClickTime float64
 
-	toast struct {
-		msg   string
-		until float64
-	}
+	dirty       bool
+	wantQuit    bool
+	toast       Toast
+	exitConfirm ConfirmDialog
 }
 
 func (s *mapState) quadrantSz() int { return s.sheetSz / 2 }
 
 func (s *mapState) isSbDragging() bool {
 	return s.layerSbDrag || s.objSbDrag || s.vSbDrag || s.hSbDrag
+}
+
+func (s *mapState) mapWindowTitle() string {
+	if s.mapPath != "" {
+		return "fz map — " + filepath.Base(s.mapPath)
+	}
+	return "fz map"
+}
+
+func (s *mapState) markDirty() {
+	if !s.dirty {
+		s.dirty = true
+		rl.SetWindowTitle(s.mapWindowTitle() + " *")
+	}
+}
+
+func (s *mapState) markClean() {
+	s.dirty = false
+	rl.SetWindowTitle(s.mapWindowTitle())
 }
 
 func (s *mapState) tileSheetLayout() (px, sz, scale int32) {
@@ -415,26 +349,6 @@ func (s *mapState) ensureLayerVisible() {
 }
 
 // ── tileset I/O ───────────────────────────────────────────────────────────────
-
-func loadTSJFile(path string) (*tiledTilesetJSON, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var ts tiledTilesetJSON
-	if err := json.Unmarshal(raw, &ts); err != nil {
-		return nil, err
-	}
-	return &ts, nil
-}
-
-func saveTSJFile(path string, ts tiledTilesetJSON) error {
-	raw, err := json.MarshalIndent(ts, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, raw, 0o644)
-}
 
 func refreshMapSheetList(s *mapState) {
 	dir := filepath.Join("assets", "gfx")
@@ -674,6 +588,8 @@ func loadMapTMJ(s *mapState, path string) error {
 	s.clampScroll()
 	refreshMapFileList(s)
 	syncSheetActive(s)
+	s.dirty = false
+	rl.SetWindowTitle("fz map — " + filepath.Base(path))
 	return nil
 }
 
@@ -816,55 +732,6 @@ func saveMapTMJ(s *mapState, path string) error {
 	return os.WriteFile(path, out, 0o644)
 }
 
-// reformatTMJTileData rewrites tile layer "data" arrays so each map row sits on
-// one JSON line instead of one element per line, making the file human-readable.
-func reformatTMJTileData(src []byte, mapW int) []byte {
-	if mapW <= 0 {
-		return src
-	}
-	lines := strings.Split(string(src), "\n")
-	out := make([]string, 0, len(lines))
-	inData := false
-	var dataIndent string
-	var vals []string
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !inData {
-			out = append(out, line)
-			if strings.HasSuffix(trimmed, `"data": [`) {
-				inData = true
-				lineContent := strings.TrimLeft(line, " \t")
-				dataIndent = line[:len(line)-len(lineContent)] + "  "
-				vals = nil
-			}
-		} else {
-			if trimmed == "]" || trimmed == "]," {
-				for start := 0; start < len(vals); start += mapW {
-					end := start + mapW
-					if end > len(vals) {
-						end = len(vals)
-					}
-					rowStr := dataIndent + strings.Join(vals[start:end], ", ")
-					if end < len(vals) {
-						rowStr += ","
-					}
-					out = append(out, rowStr)
-				}
-				out = append(out, line)
-				inData = false
-				vals = nil
-			} else {
-				v := strings.TrimRight(trimmed, ", ")
-				if v != "" {
-					vals = append(vals, v)
-				}
-			}
-		}
-	}
-	return []byte(strings.Join(out, "\n"))
-}
-
 // ── layer helpers ─────────────────────────────────────────────────────────────
 
 func (s *mapState) layerAdd() {
@@ -879,6 +746,7 @@ func (s *mapState) layerAdd() {
 	s.layers = append(s.layers, l)
 	s.activeLayer = len(s.layers) - 1
 	s.ensureLayerVisible()
+	s.markDirty()
 }
 
 func (s *mapState) layerDelete() {
@@ -891,6 +759,7 @@ func (s *mapState) layerDelete() {
 	}
 	s.clampLayerScroll()
 	s.ensureLayerVisible()
+	s.markDirty()
 }
 
 func (s *mapState) layerMoveUp() {
@@ -900,6 +769,7 @@ func (s *mapState) layerMoveUp() {
 	s.layers[s.activeLayer], s.layers[s.activeLayer-1] = s.layers[s.activeLayer-1], s.layers[s.activeLayer]
 	s.activeLayer--
 	s.ensureLayerVisible()
+	s.markDirty()
 }
 
 func (s *mapState) layerMoveDown() {
@@ -909,6 +779,7 @@ func (s *mapState) layerMoveDown() {
 	s.layers[s.activeLayer], s.layers[s.activeLayer+1] = s.layers[s.activeLayer+1], s.layers[s.activeLayer]
 	s.activeLayer++
 	s.ensureLayerVisible()
+	s.markDirty()
 }
 
 func (s *mapState) layerRenameStart() {
@@ -937,6 +808,7 @@ func (s *mapState) layerRenameConfirm() {
 		}
 	}
 	s.renaming = false
+	s.markDirty()
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
@@ -984,24 +856,19 @@ func runMap(args []string) error {
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
 
-	for !rl.WindowShouldClose() {
-		handleMapInput(state, float64(rl.GetFrameTime()))
+	rl.SetExitKey(0)
+	running := true
+	osClosed := false
 
-		if state.pendingMapPath != "" {
-			if err := loadMapTMJ(state, state.pendingMapPath); err == nil {
-				state.notify("Loaded " + filepath.Base(state.pendingMapPath))
+	for running {
+		if rl.WindowShouldClose() && !osClosed {
+			osClosed = true
+			if state.dirty {
+				state.exitConfirm.Show("Unsaved changes — quit anyway?", "Quit", "Cancel")
+			} else {
+				running = false
 			}
-			state.pendingMapPath = ""
 		}
-		if state.pendingSheetName != "" {
-			loadMapSheetFromEntry(state, state.pendingSheetName)
-			state.notify("Tileset: " + state.pendingSheetName)
-			state.pendingSheetName = ""
-		}
-
-		rl.BeginTextureMode(canvas)
-		drawMapScene(state)
-		rl.EndTextureMode()
 
 		scale, offsetX, offsetY := virtualScale()
 		dpi := float32(rl.GetRenderWidth()) / float32(rl.GetScreenWidth())
@@ -1010,6 +877,35 @@ func runMap(args []string) error {
 		soy := offsetY / dpi
 		rl.SetMouseOffset(int(-sox), int(-soy))
 		rl.SetMouseScale(1/ss, 1/ss)
+
+		handleMapInput(state, float64(rl.GetFrameTime()))
+
+		if state.wantQuit {
+			running = false
+		}
+
+		if state.pendingMapPath != "" {
+			if err := loadMapTMJ(state, state.pendingMapPath); err == nil {
+				state.toast.Notify("Loaded " + filepath.Base(state.pendingMapPath))
+			}
+			state.pendingMapPath = ""
+		}
+		if state.pendingSheetName != "" {
+			loadMapSheetFromEntry(state, state.pendingSheetName)
+			state.toast.Notify("Tileset: " + state.pendingSheetName)
+			state.pendingSheetName = ""
+		}
+
+		rl.BeginTextureMode(canvas)
+		drawMapScene(state)
+		rl.EndTextureMode()
+
+		if state.wantQuit {
+			running = false
+		}
+
+		rl.SetMouseOffset(0, 0)
+		rl.SetMouseScale(1, 1)
 
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.Black)
@@ -1034,9 +930,12 @@ func drawMapScene(s *mapState) {
 	drawMapSaveDialog(s)
 	drawMapFileDropdown(s)    // last — z-order above everything
 	drawMapTilesetDropdown(s) // last — z-order above everything
-	drawMapNotification(s)    // toast always on top
+	s.toast.Draw()
 	if s.showHelp {
 		drawMapHelpOverlay()
+	}
+	if s.exitConfirm.Draw() {
+		s.wantQuit = true
 	}
 }
 
@@ -1144,7 +1043,8 @@ func drawMapToolbar(s *mapState) {
 	if raygui.Button(rl.NewRectangle(4, 4, 44, 20), "Save") && !blocked {
 		if s.mapPath != "" {
 			if err := saveMapTMJ(s, s.mapPath); err == nil {
-				s.notify("Saved " + filepath.Base(s.mapPath))
+				s.toast.Notify("Saved " + filepath.Base(s.mapPath))
+				s.markClean()
 			}
 			refreshMapFileList(s)
 		} else {
@@ -1158,6 +1058,8 @@ func drawMapToolbar(s *mapState) {
 		s.layers = defaultLayers(s.mapW, s.mapH)
 		s.activeLayer = 0
 		s.scrollX, s.scrollY = 0, 0
+		s.dirty = false
+		rl.SetWindowTitle("fz map")
 	}
 	if raygui.Button(rl.NewRectangle(256, 4, 50, 20), "Resize") && !blocked {
 		s.resize.active = true
@@ -1668,6 +1570,7 @@ func drawMapObjectPanel(s *mapState) {
 			}
 			s.objRenaming = false
 			s.objIDEditing = false
+			s.markDirty()
 			break
 		}
 
@@ -1819,6 +1722,7 @@ func (s *mapState) createDefaultObject() {
 	}
 	layer.objects = append(layer.objects, obj)
 	s.selectedObj = len(layer.objects) - 1
+	s.markDirty()
 }
 
 func (s *mapState) createObjectFromDrag() {
@@ -1853,6 +1757,7 @@ func (s *mapState) createObjectFromDrag() {
 	}
 	layer.objects = append(layer.objects, obj)
 	s.selectedObj = len(layer.objects) - 1
+	s.markDirty()
 }
 
 func (s *mapState) objRenameConfirm() {
@@ -1864,6 +1769,7 @@ func (s *mapState) objRenameConfirm() {
 		layer.objects[s.selectedObj].Name = s.objRenameText
 	}
 	s.objRenaming = false
+	s.markDirty()
 }
 
 // ── tile panel ────────────────────────────────────────────────────────────────
@@ -2163,6 +2069,7 @@ func applyMapResize(s *mapState) {
 	}
 	s.mapW, s.mapH = w, h
 	s.resize.active = false
+	s.markDirty()
 }
 
 // ── save-as dialog ────────────────────────────────────────────────────────────
@@ -2212,7 +2119,8 @@ func commitMapSave(s *mapState) {
 		s.mapPath = path
 		s.saveActive = false
 		refreshMapFileList(s)
-		s.notify("Saved " + filepath.Base(path))
+		s.toast.Notify("Saved " + filepath.Base(path))
+		s.markClean()
 	}
 }
 
@@ -2244,34 +2152,6 @@ func drawMapStatusBar(s *mapState) {
 	status := fmt.Sprintf("Map: %dx%d  Tile: %dpx  Layer: %s  Grid: %s  Tool: %s  Tile#: %d%s",
 		s.mapW, s.mapH, s.tileSize, layerName, gridStr, toolStr, s.selectedTile, cursorStr)
 	rl.DrawText(status, 4, y+5, 10, rl.LightGray)
-}
-
-// ── toast notification ────────────────────────────────────────────────────────
-
-func (s *mapState) notify(msg string) {
-	s.toast.msg = msg
-	s.toast.until = float64(rl.GetTime()) + 1.6
-}
-
-func drawMapNotification(s *mapState) {
-	now := float64(rl.GetTime())
-	if now >= s.toast.until {
-		return
-	}
-	remaining := s.toast.until - now
-	alpha := uint8(255)
-	if remaining < 0.35 {
-		alpha = uint8(remaining / 0.35 * 255)
-	}
-	msg := s.toast.msg
-	tw := rl.MeasureText(msg, 11)
-	pw := tw + 24
-	ph := int32(20)
-	npx := (virtualW - int32(pw)) / 2
-	npy := virtualH - statusBarH - ph - 5
-	rl.DrawRectangle(npx, npy, int32(pw), ph, rl.NewColor(30, 58, 105, alpha))
-	rl.DrawRectangleLines(npx, npy, int32(pw), ph, rl.NewColor(70, 118, 210, alpha))
-	rl.DrawText(msg, npx+12, npy+4, 11, rl.NewColor(220, 235, 255, alpha))
 }
 
 // ── scroll-key and tile drawing helpers ───────────────────────────────────────
@@ -2338,6 +2218,7 @@ func (s *mapState) applyTileDraw(mx, my int, erase bool) {
 		gid := uint32(s.selectedTile+firstGID) | tileGIDFlags(s.tileFlipH, s.tileFlipV, s.tileRotation)
 		layer.data[my*s.mapW+mx] = gid
 	}
+	s.markDirty()
 }
 
 // floodFill replaces all tiles connected to (startX, startY) that share the
@@ -2375,11 +2256,15 @@ func (s *mapState) floodFill(startX, startY int, newGID uint32) {
 		layer.data[idx] = newGID
 		queue = append(queue, pt{p.x + 1, p.y}, pt{p.x - 1, p.y}, pt{p.x, p.y + 1}, pt{p.x, p.y - 1})
 	}
+	s.markDirty()
 }
 
 // ── input ─────────────────────────────────────────────────────────────────────
 
 func handleMapInput(s *mapState, dt float64) {
+	if s.exitConfirm.Active {
+		return
+	}
 	if s.resize.active {
 		handleMapResizeInput(s)
 		return
@@ -2549,11 +2434,20 @@ func handleMapInput(s *mapState, dt float64) {
 	if ctrl && rl.IsKeyPressed(rl.KeyS) {
 		if s.mapPath != "" {
 			if err := saveMapTMJ(s, s.mapPath); err == nil {
-				s.notify("Saved " + filepath.Base(s.mapPath))
+				s.toast.Notify("Saved " + filepath.Base(s.mapPath))
+				s.markClean()
 			}
 		} else {
 			s.saveActive = true
 			s.saveFilename = ""
+		}
+	}
+
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		if s.dirty {
+			s.exitConfirm.Show("Unsaved changes — quit anyway?", "Quit", "Cancel")
+		} else {
+			s.wantQuit = true
 		}
 	}
 }
@@ -2630,6 +2524,7 @@ func (s *mapState) confirmObjIDEdit() {
 		}
 	}
 	s.objIDEditing = false
+	s.markDirty()
 }
 
 func handleMapRenameInput(s *mapState) {
