@@ -37,6 +37,13 @@ const (
 	mapBelowBtnH    = int32(20)                            // 434+20=454 → 6px gap to statusBar
 )
 
+// ── minimap constants ─────────────────────────────────────────────────────────
+
+const (
+	mmSize   = int32(128) // minimap render area in virtual pixels
+	mmBorder = int32(4)   // draggable border around the render area
+)
+
 // ── undo / redo ───────────────────────────────────────────────────────────────
 
 // mapSnapshot captures tile-layer data for all layers at a point in time.
@@ -180,6 +187,9 @@ type mapState struct {
 	renaming    bool
 	renameText  string
 
+	// Pre-rendered CCW rotation icon (ROTATE_FILL flipped horizontally), same as gfx editor.
+	iconCCW rl.RenderTexture2D
+
 	// Active tileset
 	sheetImg        *rl.Image
 	sheetTex        rl.Texture2D
@@ -266,6 +276,16 @@ type mapState struct {
 	// Raw top-level TMJ fields loaded from disk; nil for new (unsaved) maps.
 	// Used by saveMapTMJ to preserve unknown fields (properties, backgroundcolor, etc.).
 	tmjBase map[string]json.RawMessage
+
+	// Minimap
+	showMinimap    bool
+	minimapX       int32
+	minimapY       int32
+	minimapTex     rl.RenderTexture2D
+	minimapDirty   bool
+	minimapDrag    bool
+	minimapDragOX  float32
+	minimapDragOY  float32
 }
 
 // vpRect returns the map viewport's (x, y, width, height) in virtual pixels.
@@ -292,6 +312,7 @@ func (s *mapState) mapWindowTitle() string {
 }
 
 func (s *mapState) markDirty() {
+	s.minimapDirty = true
 	if !s.dirty {
 		s.dirty = true
 		rl.SetWindowTitle(s.mapWindowTitle() + " *")
@@ -545,6 +566,7 @@ func loadMapSheetFromEntry(s *mapState, name string) {
 	s.tilesetFirstGID = 1
 	s.selectedTile = 0
 	s.activeQuadrant = 0
+	s.minimapDirty = true
 }
 
 // ── map I/O ───────────────────────────────────────────────────────────────────
@@ -699,6 +721,7 @@ func loadMapTMJ(s *mapState, path string) error {
 	refreshMapFileList(s)
 	syncSheetActive(s)
 	s.dirty = false
+	s.minimapDirty = true
 	s.undoStack = s.undoStack[:0]
 	s.redoStack = s.redoStack[:0]
 	rl.SetWindowTitle("fz map — " + filepath.Base(path))
@@ -1107,6 +1130,203 @@ func (s *mapState) layerRenameConfirm() {
 	s.markDirty()
 }
 
+// ── minimap ───────────────────────────────────────────────────────────────────
+
+// renderMinimap redraws s.minimapTex from the current tile layers.
+// Must be called OUTSIDE BeginTextureMode(canvas) since it uses its own texture target.
+func renderMinimap(s *mapState) {
+	if s.minimapTex.ID == 0 {
+		return
+	}
+	rl.BeginTextureMode(s.minimapTex)
+	rl.ClearBackground(rl.NewColor(18, 18, 24, 255))
+
+	if s.mapW > 0 && s.mapH > 0 && s.sheetTex.ID > 0 && s.sheetColumns > 0 && s.tileSize > 0 {
+		tileW := float32(mmSize) / float32(s.mapW)
+		tileH := float32(mmSize) / float32(s.mapH)
+
+		// Draw layers bottom-up (index len-1 first) to match viewport order
+		for li := len(s.layers) - 1; li >= 0; li-- {
+			layer := &s.layers[li]
+			if !layer.visible || layer.kind != layerKindTile || len(layer.data) == 0 {
+				continue
+			}
+			for row := 0; row < s.mapH; row++ {
+				for col := 0; col < s.mapW; col++ {
+					gid := layer.data[row*s.mapW+col]
+					rawID := gid &^ gidFlagMask
+					if rawID == 0 {
+						continue
+					}
+					ti := int(rawID) - s.tilesetFirstGID
+					if ti < 0 {
+						continue
+					}
+					p := gidToRenderParams(gid & gidFlagMask)
+					dst := rl.NewRectangle(
+						float32(col)*tileW,
+						float32(row)*tileH,
+						tileW,
+						tileH,
+					)
+					drawTileTransformed(s.sheetTex, ti, s.sheetColumns, s.tileSize, dst,
+						p.flipH, p.flipV, p.rotation, rl.White)
+				}
+			}
+		}
+	}
+	rl.EndTextureMode()
+	s.minimapDirty = false
+}
+
+// mouseOverMinimap reports whether the current mouse position is anywhere inside
+// the minimap window (border + content). Used to suppress input in draw functions
+// that check rl.IsMouseButtonPressed directly (bypassing raygui.Lock).
+func (s *mapState) mouseOverMinimap() bool {
+	if !s.showMinimap {
+		return false
+	}
+	m := rl.GetMousePosition()
+	return m.X >= float32(s.minimapX) && m.X < float32(s.minimapX+mmSize+2*mmBorder) &&
+		m.Y >= float32(s.minimapY) && m.Y < float32(s.minimapY+mmSize+2*mmBorder)
+}
+
+// minimapRect returns the bounding rectangle of the full minimap window
+// (border + content) in virtual pixels.
+func (s *mapState) minimapRect() rl.Rectangle {
+	return rl.NewRectangle(
+		float32(s.minimapX),
+		float32(s.minimapY),
+		float32(mmSize+2*mmBorder),
+		float32(mmSize+2*mmBorder),
+	)
+}
+
+// handleMinimapInput processes minimap drag. Returns true if the minimap
+// consumed the mouse event so other hit-tests should be skipped.
+func handleMinimapInput(s *mapState) bool {
+	if !s.showMinimap {
+		return false
+	}
+	mouse := rl.GetMousePosition()
+	mmW := float32(mmSize + 2*mmBorder)
+	mmH := float32(mmSize + 2*mmBorder)
+	mx, my := mouse.X, mouse.Y
+
+	inOuter := mx >= float32(s.minimapX) && mx < float32(s.minimapX)+mmW &&
+		my >= float32(s.minimapY) && my < float32(s.minimapY)+mmH
+	inInner := mx >= float32(s.minimapX+mmBorder) && mx < float32(s.minimapX+mmBorder+mmSize) &&
+		my >= float32(s.minimapY+mmBorder) && my < float32(s.minimapY+mmBorder+mmSize)
+	onBorder := inOuter && !inInner
+
+	if s.minimapDrag {
+		if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+			newX := int32(mx - s.minimapDragOX)
+			newY := int32(my - s.minimapDragOY)
+			// Clamp inside virtual screen
+			maxX := virtualW - mmSize - 2*mmBorder
+			maxY := virtualH - mmSize - 2*mmBorder
+			if newX < 0 {
+				newX = 0
+			}
+			if newX > maxX {
+				newX = maxX
+			}
+			if newY < 0 {
+				newY = 0
+			}
+			if newY > maxY {
+				newY = maxY
+			}
+			s.minimapX = newX
+			s.minimapY = newY
+			return true
+		}
+		s.minimapDrag = false
+	}
+
+	if onBorder && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		s.minimapDrag = true
+		s.minimapDragOX = mx - float32(s.minimapX)
+		s.minimapDragOY = my - float32(s.minimapY)
+		return true
+	}
+
+	// Click or drag on the content area: center viewport on the clicked map position
+	if inInner && rl.IsMouseButtonDown(rl.MouseButtonLeft) && s.mapW > 0 && s.mapH > 0 && s.tileSize > 0 && s.zoom > 0 {
+		relX := mx - float32(s.minimapX+mmBorder)
+		relY := my - float32(s.minimapY+mmBorder)
+		tileCol := int(relX / float32(mmSize) * float32(s.mapW))
+		tileRow := int(relY / float32(mmSize) * float32(s.mapH))
+		_, _, vpW, vpH := s.vpRect()
+		cellSz := s.tileSize * s.zoom
+		visW := int(vpW) / cellSz
+		visH := int(vpH) / cellSz
+		s.scrollX = tileCol - visW/2
+		s.scrollY = tileRow - visH/2
+		s.clampScroll()
+		return true
+	}
+
+	return inOuter // block tile interaction when cursor is anywhere over the minimap
+}
+
+// drawMinimap renders the cached minimap texture plus the viewport frame overlay.
+// Called inside BeginTextureMode(canvas) after all other UI, always (not gated by focusMode).
+func drawMinimap(s *mapState) {
+	if !s.showMinimap || s.minimapTex.ID == 0 {
+		return
+	}
+	mx := s.minimapX
+	my := s.minimapY
+	sz := mmSize
+	b := mmBorder
+
+	borderCol := rl.NewColor(90, 110, 160, 255)
+	if s.minimapDrag {
+		borderCol = rl.NewColor(130, 160, 220, 255)
+	}
+
+	// Background border
+	rl.DrawRectangle(mx, my, sz+2*b, sz+2*b, rl.NewColor(20, 22, 32, 255))
+	rl.DrawRectangleLines(mx, my, sz+2*b, sz+2*b, borderCol)
+
+	// Minimap texture (RenderTexture Y is flipped)
+	src := rl.NewRectangle(0, 0, float32(sz), -float32(sz))
+	dst := rl.NewRectangle(float32(mx+b), float32(my+b), float32(sz), float32(sz))
+	rl.DrawTexturePro(s.minimapTex.Texture, src, dst, rl.NewVector2(0, 0), 0, rl.White)
+
+	// Viewport frame
+	if s.mapW > 0 && s.mapH > 0 && s.tileSize > 0 && s.zoom > 0 {
+		_, _, vpW, vpH := s.vpRect()
+		cellSz := s.tileSize * s.zoom
+		visW := float32(int(vpW)/cellSz) / float32(s.mapW) * float32(sz)
+		visH := float32(int(vpH)/cellSz) / float32(s.mapH) * float32(sz)
+		frameX := float32(mx+b) + float32(s.scrollX)/float32(s.mapW)*float32(sz)
+		frameY := float32(my+b) + float32(s.scrollY)/float32(s.mapH)*float32(sz)
+		if visW < 1 {
+			visW = 1
+		}
+		if visH < 1 {
+			visH = 1
+		}
+		// Clamp frame within minimap area
+		contentRight := float32(mx + b + sz)
+		contentBottom := float32(my + b + sz)
+		if frameX+visW > contentRight {
+			visW = contentRight - frameX
+		}
+		if frameY+visH > contentBottom {
+			visH = contentBottom - frameY
+		}
+		rl.DrawRectangleLinesEx(
+			rl.NewRectangle(frameX, frameY, visW, visH),
+			1,
+			rl.NewColor(255, 220, 50, 220),
+		)
+	}
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 
 func runMap(args []string) error {
@@ -1115,10 +1335,20 @@ func runMap(args []string) error {
 	rl.SetTargetFPS(60)
 	defer rl.CloseWindow()
 
+	iconCCW := rl.LoadRenderTexture(16, 16)
+	rl.BeginTextureMode(iconCCW)
+	rl.ClearBackground(rl.NewColor(0, 0, 0, 0))
+	raygui.DrawIcon(raygui.ICON_ROTATE_FILL, 0, 0, 1, rl.White)
+	rl.EndTextureMode()
+	defer rl.UnloadRenderTexture(iconCCW)
+
 	state := &mapState{
 		mapW: 32, mapH: 32, tileSize: 16, zoom: 2,
 		showGrid: true, activeTool: toolPencil,
 		selectedObj: -1,
+		minimapX: virtualW - mmSize - 2*mmBorder - 4,
+		minimapY: toolbarH + 4,
+		iconCCW:  iconCCW,
 	}
 	state.layers = defaultLayers(state.mapW, state.mapH)
 	refreshMapSheetList(state)
@@ -1151,6 +1381,10 @@ func runMap(args []string) error {
 
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
+
+	state.minimapTex = rl.LoadRenderTexture(mmSize, mmSize)
+	defer rl.UnloadRenderTexture(state.minimapTex)
+	state.minimapDirty = true
 
 	rl.SetExitKey(0)
 	running := true
@@ -1192,6 +1426,10 @@ func runMap(args []string) error {
 			state.pendingSheetName = ""
 		}
 
+		if state.showMinimap && state.minimapDirty {
+			renderMinimap(state)
+		}
+
 		rl.BeginTextureMode(canvas)
 		drawMapScene(state)
 		rl.EndTextureMode()
@@ -1217,6 +1455,18 @@ func runMap(args []string) error {
 
 func drawMapScene(s *mapState) {
 	rl.ClearBackground(rl.NewColor(45, 45, 48, 255))
+
+	// Lock raygui controls so clicks on underlying UI don't register while the
+	// minimap is visible and the cursor is over it.
+	if s.showMinimap {
+		m := rl.GetMousePosition()
+		if m.X >= float32(s.minimapX) && m.X < float32(s.minimapX+mmSize+2*mmBorder) &&
+			m.Y >= float32(s.minimapY) && m.Y < float32(s.minimapY+mmSize+2*mmBorder) {
+			raygui.Lock()
+			defer raygui.Unlock()
+		}
+	}
+
 	if !s.focusMode {
 		drawMapToolbar(s)
 	}
@@ -1232,6 +1482,7 @@ func drawMapScene(s *mapState) {
 		drawMapFileDropdown(s)    // last — z-order above everything
 		drawMapTilesetDropdown(s) // last — z-order above everything
 	}
+	drawMinimap(s)
 	s.toast.Draw()
 	if s.showHelp {
 		drawMapHelpOverlay()
@@ -1244,7 +1495,7 @@ func drawMapScene(s *mapState) {
 func drawMapHelpOverlay() {
 	const (
 		dw = int32(460)
-		dh = int32(328)
+		dh = int32(340)
 	)
 	dx := (virtualW - dw) / 2
 	dy := (virtualH - dh) / 2
@@ -1294,6 +1545,7 @@ func drawMapHelpOverlay() {
 			{"Ctrl+Z", "Undo"},
 			{"Ctrl+Y / Ctrl+Shift+Z", "Redo"},
 			{"G", "Toggle grid"},
+			{"M", "Toggle minimap"},
 			{"Tab", "Toggle focus mode"},
 			{"F1 / Esc", "Close this help"},
 		}},
@@ -1368,6 +1620,7 @@ func drawMapToolbar(s *mapState) {
 		s.undoStack = s.undoStack[:0]
 		s.redoStack = s.redoStack[:0]
 		s.tmjBase = nil
+		s.minimapDirty = true
 		rl.SetWindowTitle("fz map")
 	}
 	if raygui.Button(rl.NewRectangle(256, 4, 50, 20), "Resize") && !blocked {
@@ -1413,7 +1666,10 @@ func drawMapViewport(s *mapState) {
 	if cellSz > 0 {
 		mouse := rl.GetMousePosition()
 		mx, my := mouse.X, mouse.Y
-		if mx >= float32(vx) && mx < float32(vx+vw) &&
+		overMinimap := s.showMinimap &&
+			mx >= float32(s.minimapX) && mx < float32(s.minimapX+mmSize+2*mmBorder) &&
+			my >= float32(s.minimapY) && my < float32(s.minimapY+mmSize+2*mmBorder)
+		if !overMinimap && mx >= float32(vx) && mx < float32(vx+vw) &&
 			my >= float32(vy) && my < float32(vy+vh) {
 			col := int((mx - float32(vx)) / float32(cellSz))
 			row := int((my - float32(vy)) / float32(cellSz))
@@ -1491,7 +1747,7 @@ func drawMapViewportScrollbars(s *mapState) {
 		}
 		thumbY := ty + int32(s.scrollY)*(int32(th)-thumbH)/maxSc
 		hitR := rl.NewRectangle(float32(tx)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
-		if !s.vSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+		if !s.vSbDrag && !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
 			s.vSbDrag = true
 			s.vSbDragOff = mouse.Y - float32(thumbY)
 		}
@@ -1537,7 +1793,7 @@ func drawMapViewportScrollbars(s *mapState) {
 		}
 		thumbX := tx + int32(s.scrollX)*(int32(tw)-thumbW)/maxSc
 		hitR := rl.NewRectangle(float32(thumbX), float32(ty)-2, float32(thumbW), float32(sbH)+4)
-		if !s.hSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+		if !s.hSbDrag && !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
 			s.hSbDrag = true
 			s.hSbDragOff = mouse.X - float32(thumbX)
 		}
@@ -1713,6 +1969,7 @@ func drawMapBelowLayers(s *mapState) {
 		raygui.CheckBox(rl.NewRectangle(float32(listX)+4, float32(rowY)+3, 14, 14), "", &vis)
 		if vis != layer.visible {
 			s.layers[i].visible = vis
+			s.minimapDirty = true
 		}
 
 		// Kind badge
@@ -1740,7 +1997,7 @@ func drawMapBelowLayers(s *mapState) {
 			rl.DrawText(layer.name, listX+40, rowY+5, 10, nameCol)
 			// -10 to leave room for the scrollbar
 			r := rl.NewRectangle(float32(listX+40), float32(rowY), float32(listW-50), float32(mapLayerRowH))
-			if rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 				now := rl.GetTime()
 				if i == s.activeLayer && now-s.layerLastClickTime < 0.4 {
 					s.layerRenameStart()
@@ -1786,7 +2043,7 @@ func drawMapBelowLayers(s *mapState) {
 		}
 		thumbY := sbY + int32(s.layerScroll)*(sbH-thumbH)/maxSc
 		hitR := rl.NewRectangle(float32(sbX)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
-		if !s.layerSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+		if !s.layerSbDrag && !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
 			s.layerSbDrag = true
 			s.layerSbDragOff = mouse.Y - float32(thumbY)
 		}
@@ -1913,7 +2170,7 @@ func drawMapObjectPanel(s *mapState) {
 		// Name region: dot + name, left of ID
 		nameRect := rl.NewRectangle(float32(listX), float32(rowY), float32(idX-listX), float32(rowH))
 
-		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 			if rl.CheckCollisionPointRec(mouse, nameRect) {
 				if i == s.selectedObj && now-s.lastClickTime < 0.4 && s.lastClickType == 1 {
 					s.objRenaming = true
@@ -1995,7 +2252,7 @@ func drawMapObjectPanel(s *mapState) {
 		}
 		thumbY := sbY + int32(s.objListScroll)*(sbH-thumbH)/maxSc
 		hitR := rl.NewRectangle(float32(sbX)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
-		if !s.objSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+		if !s.objSbDrag && !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
 			s.objSbDrag = true
 			s.objSbDragOff = mouse.Y - float32(thumbY)
 		}
@@ -2111,42 +2368,72 @@ func drawMapTilePanel(s *mapState) {
 	lw := rl.MeasureText("TOOLS", 10)
 	rl.DrawText("TOOLS", panelX+(panelW-lw)/2, mapRToolsLabelY, 10, rl.NewColor(180, 180, 180, 255))
 
+	mouse := rl.GetMousePosition()
+	var hoveredTip string
+	tip := func(text string, bx, by float32) {
+		if rl.CheckCollisionPointRec(mouse, rl.NewRectangle(bx, by, bsz, bsz)) {
+			hoveredTip = text
+		}
+	}
+
 	x := float32(panelX + 4)
 	y1 := float32(mapRTools1Y)
 	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_PENCIL, ""), toolPencil, s.activeTool) {
 		s.activeTool = toolPencil
 	}
+	tip("Pencil (P)", x, y1)
 	x += step
 	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_RUBBER, ""), toolEraser, s.activeTool) {
 		s.activeTool = toolEraser
 	}
+	tip("Eraser (E)", x, y1)
 	x += step
 	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_COLOR_BUCKET, ""), toolBucket, s.activeTool) {
 		s.activeTool = toolBucket
 	}
+	tip("Fill (F)", x, y1)
 
 	x = float32(panelX + 4)
 	y2 := float32(mapRTools2Y)
-	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_ARROW_LEFT_FILL, "")) {
+	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_SYMMETRY_HORIZONTAL, "")) {
 		s.tileFlipH = !s.tileFlipH
 	}
 	if s.tileFlipH {
 		rl.DrawRectangleLines(int32(x)-1, int32(y2)-1, int32(bsz)+2, int32(bsz)+2, mapToolHighlight)
 	}
+	tip("Flip Horizontal (H)", x, y2)
 	x += step
-	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_ARROW_UP_FILL, "")) {
+	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_SYMMETRY_VERTICAL, "")) {
 		s.tileFlipV = !s.tileFlipV
 	}
 	if s.tileFlipV {
 		rl.DrawRectangleLines(int32(x)-1, int32(y2)-1, int32(bsz)+2, int32(bsz)+2, mapToolHighlight)
 	}
+	tip("Flip Vertical (V)", x, y2)
 	x += step
 	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_ROTATE_FILL, "")) {
 		s.tileRotation = (s.tileRotation + 1) & 3
 	}
+	tip("Rotate CW (R)", x, y2)
 	x += step
-	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_ROTATE, "")) {
+	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), "") {
 		s.tileRotation = (s.tileRotation + 3) & 3
+	}
+	tip("Rotate CCW (Shift+R)", x, y2)
+	// Overlay the pre-rendered ROTATE_FILL icon flipped horizontally.
+	if s.iconCCW.ID > 0 {
+		tw := float32(s.iconCCW.Texture.Width)
+		th := float32(s.iconCCW.Texture.Height)
+		rl.DrawTexturePro(
+			s.iconCCW.Texture,
+			rl.NewRectangle(tw, th, -tw, -th),
+			rl.NewRectangle(x+(bsz-tw)/2, y2+(bsz-th)/2, tw, th),
+			rl.Vector2Zero(), 0, rl.White,
+		)
+	}
+
+	if hoveredTip != "" {
+		drawToolTip(hoveredTip, mouse.X, mouse.Y)
 	}
 
 	// Tile preview – 32×32 box at the right edge of the tools section
@@ -2257,7 +2544,7 @@ func drawMapTileSheet(s *mapState) {
 		rl.DrawRectangleLines(tx, mapSheetTabY, tabW, mapSheetTabH, rl.NewColor(60, 60, 60, 255))
 		rl.DrawText(fmt.Sprintf("%d", i+1), tx+tabW/2-3, mapSheetTabY+4, 10, rl.White)
 		r := rl.NewRectangle(float32(tx), float32(mapSheetTabY), float32(tabW), float32(mapSheetTabH))
-		if rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 			s.activeQuadrant = i
 		}
 	}
@@ -2315,7 +2602,7 @@ func drawMapTileSheet(s *mapState) {
 			row := int((my - mapSheetGridY) / cellSz)
 			rl.DrawRectangleLines(px+int32(col)*cellSz, mapSheetGridY+int32(row)*cellSz,
 				cellSz, cellSz, rl.NewColor(255, 255, 100, 200))
-			if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			if !s.mouseOverMinimap() && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 				tpr := s.sheetSz / s.tileSize
 				s.selectedTile = (int(quadOffY)/s.tileSize+row)*tpr + int(quadOffX)/s.tileSize + col
 			}
@@ -2621,9 +2908,20 @@ func handleMapInput(s *mapState, dt float64) {
 	if rl.IsKeyPressed(rl.KeyF1) {
 		s.showHelp = true
 	}
+	if rl.IsKeyPressed(rl.KeyM) {
+		s.showMinimap = !s.showMinimap
+		if s.showMinimap {
+			s.minimapDirty = true
+		}
+	}
 	if rl.IsKeyPressed(rl.KeyTab) {
 		s.focusMode = !s.focusMode
 		s.clampScroll()
+	}
+
+	// Process minimap drag before tile interaction checks
+	if handleMinimapInput(s) {
+		return
 	}
 	if rl.IsKeyPressed(rl.KeyPageUp) {
 		if s.activeLayer > 0 {
