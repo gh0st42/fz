@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -38,35 +39,64 @@ const (
 
 // ── Tiled JSON types ──────────────────────────────────────────────────────────
 
+type tiledTileData struct {
+	ID         int             `json:"id"`
+	Properties []tiledProperty `json:"properties,omitempty"`
+}
+
 type tiledTilesetJSON struct {
-	Columns      int    `json:"columns"`
-	Image        string `json:"image"`
-	ImageHeight  int    `json:"imageheight"`
-	ImageWidth   int    `json:"imagewidth"`
-	Margin       int    `json:"margin"`
-	Name         string `json:"name"`
-	Spacing      int    `json:"spacing"`
-	TileCount    int    `json:"tilecount"`
-	TileHeight   int    `json:"tileheight"`
-	TileWidth    int    `json:"tilewidth"`
-	Type         string `json:"type"`
-	Version      string `json:"version"`
-	TiledVersion string `json:"tiledversion"`
+	Columns      int              `json:"columns"`
+	Image        string           `json:"image"`
+	ImageHeight  int              `json:"imageheight"`
+	ImageWidth   int              `json:"imagewidth"`
+	Margin       int              `json:"margin"`
+	Name         string           `json:"name"`
+	Spacing      int              `json:"spacing"`
+	TileCount    int              `json:"tilecount"`
+	TileHeight   int              `json:"tileheight"`
+	TileWidth    int              `json:"tilewidth"`
+	Tiles        []tiledTileData  `json:"tiles,omitempty"`
+	Type         string           `json:"type"`
+	Version      string           `json:"version"`
+	TiledVersion string           `json:"tiledversion"`
+}
+
+type tiledProperty struct {
+	Name  string          `json:"name"`
+	Type  string          `json:"type"`
+	Value json.RawMessage `json:"value"`
+}
+
+// mapObject represents a Tiled rect object (or best-effort other types).
+// Unknown fields in loaded TMJ are discarded on re-save.
+type mapObject struct {
+	ID         int              `json:"id"`
+	Name       string           `json:"name"`
+	ObjType    string           `json:"type,omitempty"`
+	X          float64          `json:"x"`
+	Y          float64          `json:"y"`
+	Width      float64          `json:"width"`
+	Height     float64          `json:"height"`
+	Rotation   float64          `json:"rotation,omitempty"`
+	Visible    bool             `json:"visible"`
+	Ellipse    bool             `json:"ellipse,omitempty"`
+	Point      bool             `json:"point,omitempty"`
+	Properties []tiledProperty  `json:"properties,omitempty"`
 }
 
 type tiledLayerJSON struct {
-	Data      []uint32           `json:"data,omitempty"`
-	DrawOrder string             `json:"draworder,omitempty"`
-	Height    int                `json:"height,omitempty"`
-	ID        int                `json:"id"`
-	Name      string             `json:"name"`
-	Objects   *[]json.RawMessage `json:"objects,omitempty"`
-	Opacity   float64            `json:"opacity"`
-	Type      string             `json:"type"`
-	Visible   bool               `json:"visible"`
-	Width     int                `json:"width,omitempty"`
-	X         int                `json:"x"`
-	Y         int                `json:"y"`
+	Data      []uint32      `json:"data,omitempty"`
+	DrawOrder string        `json:"draworder,omitempty"`
+	Height    int           `json:"height,omitempty"`
+	ID        int           `json:"id"`
+	Name      string        `json:"name"`
+	Objects   *[]mapObject  `json:"objects,omitempty"`
+	Opacity   float64       `json:"opacity"`
+	Type      string        `json:"type"`
+	Visible   bool          `json:"visible"`
+	Width     int           `json:"width,omitempty"`
+	X         int           `json:"x"`
+	Y         int           `json:"y"`
 }
 
 type tiledTilesetRefJSON struct {
@@ -200,8 +230,8 @@ type mapLayer struct {
 	name    string
 	visible bool
 	kind    layerKind
-	data    []uint32           // tile GIDs (len = mapW*mapH); nil for object layers
-	objects []json.RawMessage  // preserved Tiled objects; nil for tile layers
+	data    []uint32    // tile GIDs (len = mapW*mapH); nil for object layers
+	objects []mapObject // rect objects; nil for tile layers
 }
 
 type mapResizeDialog struct {
@@ -216,7 +246,6 @@ type mapState struct {
 	tileSize   int
 	zoom       int
 	mapPath    string
-	nextObjID  int
 
 	scrollX, scrollY int
 	showGrid         bool
@@ -274,9 +303,45 @@ type mapState struct {
 
 	resize   mapResizeDialog
 	showHelp bool
+
+	// Object layer editing
+	objListScroll int
+	selectedObj   int  // index in active layer's objects, -1 = none
+	objRenaming   bool
+	objRenameText string
+	objIDEditing  bool
+	objIDText     string
+	lastClickTime float64
+	lastClickType int // 1=name area 2=id area (for double-click detection)
+
+	// Object drag-to-draw state
+	objDragActive     bool
+	objDragX0, objDragY0 int
+	objDragX1, objDragY1 int
+
+	// Scrollbar drag state
+	layerSbDrag    bool
+	layerSbDragOff float32
+	objSbDrag      bool
+	objSbDragOff   float32
+	vSbDrag        bool
+	vSbDragOff     float32
+	hSbDrag        bool
+	hSbDragOff     float32
+	// Layer double-click rename
+	layerLastClickTime float64
+
+	toast struct {
+		msg   string
+		until float64
+	}
 }
 
 func (s *mapState) quadrantSz() int { return s.sheetSz / 2 }
+
+func (s *mapState) isSbDragging() bool {
+	return s.layerSbDrag || s.objSbDrag || s.vSbDrag || s.hSbDrag
+}
 
 func (s *mapState) tileSheetLayout() (px, sz, scale int32) {
 	qSz := int32(s.quadrantSz())
@@ -470,10 +535,10 @@ func defaultLayers(w, h int) []mapLayer {
 	// Draw order in drawMapTileLayers iterates slice in reverse.
 	return []mapLayer{
 		{name: "Above", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
-		{name: "_Encounters", visible: true, kind: layerKindObject, objects: []json.RawMessage{}},
-		{name: "_Events", visible: true, kind: layerKindObject, objects: []json.RawMessage{}},
 		{name: "Foreground", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
 		{name: "Background", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
+		{name: "_Events", visible: true, kind: layerKindObject, objects: []mapObject{}},
+		{name: "_Encounters", visible: true, kind: layerKindObject, objects: []mapObject{}},
 	}
 }
 
@@ -522,7 +587,6 @@ func loadMapTMJ(s *mapState, path string) error {
 		s.tileSize = 16
 	}
 	s.mapPath = path
-	s.nextObjID = tm.NextObjectID
 
 	// TODO: only the first tileset is loaded. Maps that reference multiple tilesets
 	// will have GIDs from the second+ tilesets resolved against the first sheet,
@@ -584,7 +648,7 @@ func loadMapTMJ(s *mapState, path string) error {
 			if jl.Objects != nil {
 				layer.objects = *jl.Objects
 			} else {
-				layer.objects = []json.RawMessage{}
+				layer.objects = []mapObject{}
 			}
 		default:
 			layer.kind = layerKindTile
@@ -641,28 +705,70 @@ func saveMapTMJ(s *mapState, path string) error {
 		return err
 	}
 
-	// Auto-create TSJ if missing and we have a loaded tileset
+	// Always write TSJ so tile flags stay in sync
 	if s.tilesetTSJPath != "" && s.sheetSz > 0 && s.tileSize > 0 {
-		if _, err := os.Stat(s.tilesetTSJPath); os.IsNotExist(err) {
-			cols := s.sheetSz / s.tileSize
-			imgRel := filepath.Base(s.tilesetImgPath)
-			ts := tiledTilesetJSON{
-				Columns: cols, Image: imgRel,
-				ImageWidth: s.sheetSz, ImageHeight: s.sheetSz,
-				Name: s.tilesetName, TileCount: cols * cols,
-				TileWidth: s.tileSize, TileHeight: s.tileSize,
-				Type: "tileset", Version: "1.10", TiledVersion: "1.10.2",
-			}
-			_ = saveTSJFile(s.tilesetTSJPath, ts)
+		cols := s.sheetSz / s.tileSize
+		imgRel := filepath.Base(s.tilesetImgPath)
+		ts := tiledTilesetJSON{
+			Columns: cols, Image: imgRel,
+			ImageWidth: s.sheetSz, ImageHeight: s.sheetSz,
+			Name: s.tilesetName, TileCount: cols * cols,
+			TileWidth: s.tileSize, TileHeight: s.tileSize,
+			Type: "tileset", Version: "1.10", TiledVersion: "1.10.2",
 		}
+		if s.tilesetImgPath != "" {
+			if metaJSON, err := readPNGMeta(s.tilesetImgPath); err == nil && metaJSON != "" {
+				var meta tileMeta
+				if json.Unmarshal([]byte(metaJSON), &meta) == nil {
+					for idStr, flags := range meta.Flags {
+						if flags == 0 {
+							continue
+						}
+						tileID, err := strconv.Atoi(idStr)
+						if err != nil {
+							continue
+						}
+						var props []tiledProperty
+						for bit := 0; bit < 8; bit++ {
+							if flags&(1<<uint(bit)) != 0 {
+								boolVal, _ := json.Marshal(true)
+								props = append(props, tiledProperty{
+									Name:  fmt.Sprintf("flag_%d", bit),
+									Type:  "bool",
+									Value: json.RawMessage(boolVal),
+								})
+							}
+						}
+						if len(props) > 0 {
+							ts.Tiles = append(ts.Tiles, tiledTileData{
+								ID:         tileID,
+								Properties: props,
+							})
+						}
+					}
+					sort.Slice(ts.Tiles, func(i, j int) bool {
+						return ts.Tiles[i].ID < ts.Tiles[j].ID
+					})
+				}
+			}
+		}
+		_ = saveTSJFile(s.tilesetTSJPath, ts)
 	}
 
+	maxObjID := 0
+	for _, l := range s.layers {
+		for _, obj := range l.objects {
+			if obj.ID > maxObjID {
+				maxObjID = obj.ID
+			}
+		}
+	}
 	tm := tiledMapJSON{
 		CompressionLevel: -1, Height: s.mapH, Width: s.mapW,
 		Orientation: "orthogonal", RenderOrder: "right-down",
 		TiledVersion: "1.10.2", TileHeight: s.tileSize, TileWidth: s.tileSize,
 		Type: "map", Version: "1.10",
-		NextLayerID: len(s.layers) + 1, NextObjectID: s.nextObjID,
+		NextLayerID: len(s.layers) + 1, NextObjectID: maxObjID + 1,
 	}
 
 	if s.tilesetTSJPath != "" {
@@ -695,7 +801,7 @@ func saveMapTMJ(s *mapState, path string) error {
 			jl.DrawOrder = "topdown"
 			objs := layer.objects
 			if objs == nil {
-				objs = []json.RawMessage{}
+				objs = []mapObject{}
 			}
 			jl.Objects = &objs
 		}
@@ -706,7 +812,57 @@ func saveMapTMJ(s *mapState, path string) error {
 	if err != nil {
 		return err
 	}
+	out = reformatTMJTileData(out, s.mapW)
 	return os.WriteFile(path, out, 0o644)
+}
+
+// reformatTMJTileData rewrites tile layer "data" arrays so each map row sits on
+// one JSON line instead of one element per line, making the file human-readable.
+func reformatTMJTileData(src []byte, mapW int) []byte {
+	if mapW <= 0 {
+		return src
+	}
+	lines := strings.Split(string(src), "\n")
+	out := make([]string, 0, len(lines))
+	inData := false
+	var dataIndent string
+	var vals []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !inData {
+			out = append(out, line)
+			if strings.HasSuffix(trimmed, `"data": [`) {
+				inData = true
+				lineContent := strings.TrimLeft(line, " \t")
+				dataIndent = line[:len(line)-len(lineContent)] + "  "
+				vals = nil
+			}
+		} else {
+			if trimmed == "]" || trimmed == "]," {
+				for start := 0; start < len(vals); start += mapW {
+					end := start + mapW
+					if end > len(vals) {
+						end = len(vals)
+					}
+					rowStr := dataIndent + strings.Join(vals[start:end], ", ")
+					if end < len(vals) {
+						rowStr += ","
+					}
+					out = append(out, rowStr)
+				}
+				out = append(out, line)
+				inData = false
+				vals = nil
+			} else {
+				v := strings.TrimRight(trimmed, ", ")
+				if v != "" {
+					vals = append(vals, v)
+				}
+			}
+		}
+	}
+	return []byte(strings.Join(out, "\n"))
 }
 
 // ── layer helpers ─────────────────────────────────────────────────────────────
@@ -718,7 +874,7 @@ func (s *mapState) layerAdd() {
 	if kind == layerKindTile {
 		l.data = make([]uint32, s.mapW*s.mapH)
 	} else {
-		l.objects = []json.RawMessage{}
+		l.objects = []mapObject{}
 	}
 	s.layers = append(s.layers, l)
 	s.activeLayer = len(s.layers) - 1
@@ -777,7 +933,7 @@ func (s *mapState) layerRenameConfirm() {
 			l.objects = nil
 		} else {
 			l.data = nil
-			l.objects = []json.RawMessage{}
+			l.objects = []mapObject{}
 		}
 	}
 	s.renaming = false
@@ -793,7 +949,8 @@ func runMap(args []string) error {
 
 	state := &mapState{
 		mapW: 32, mapH: 32, tileSize: 16, zoom: 2,
-		showGrid: true, activeTool: toolPencil, nextObjID: 1,
+		showGrid: true, activeTool: toolPencil,
+		selectedObj: -1,
 	}
 	state.layers = defaultLayers(state.mapW, state.mapH)
 	refreshMapSheetList(state)
@@ -831,11 +988,14 @@ func runMap(args []string) error {
 		handleMapInput(state, float64(rl.GetFrameTime()))
 
 		if state.pendingMapPath != "" {
-			_ = loadMapTMJ(state, state.pendingMapPath)
+			if err := loadMapTMJ(state, state.pendingMapPath); err == nil {
+				state.notify("Loaded " + filepath.Base(state.pendingMapPath))
+			}
 			state.pendingMapPath = ""
 		}
 		if state.pendingSheetName != "" {
 			loadMapSheetFromEntry(state, state.pendingSheetName)
+			state.notify("Tileset: " + state.pendingSheetName)
 			state.pendingSheetName = ""
 		}
 
@@ -874,6 +1034,100 @@ func drawMapScene(s *mapState) {
 	drawMapSaveDialog(s)
 	drawMapFileDropdown(s)    // last — z-order above everything
 	drawMapTilesetDropdown(s) // last — z-order above everything
+	drawMapNotification(s)    // toast always on top
+	if s.showHelp {
+		drawMapHelpOverlay()
+	}
+}
+
+func drawMapHelpOverlay() {
+	const (
+		dw = int32(460)
+		dh = int32(304)
+	)
+	dx := (virtualW - dw) / 2
+	dy := (virtualH - dh) / 2
+
+	rl.DrawRectangle(0, 0, virtualW, virtualH, rl.NewColor(0, 0, 0, 170))
+	rl.DrawRectangle(dx, dy, dw, dh, rl.NewColor(30, 32, 42, 255))
+	rl.DrawRectangleLines(dx, dy, dw, dh, rl.NewColor(80, 110, 170, 255))
+
+	titleCol := rl.NewColor(180, 200, 230, 255)
+	headCol := rl.NewColor(130, 160, 210, 255)
+	keyCol := rl.NewColor(220, 220, 120, 255)
+	valCol := rl.NewColor(190, 190, 200, 255)
+	dimCol := rl.NewColor(110, 110, 130, 255)
+
+	tw := rl.MeasureText("fz map — keyboard shortcuts", 11)
+	rl.DrawText("fz map — keyboard shortcuts", dx+(dw-tw)/2, dy+8, 11, titleCol)
+	rl.DrawLine(dx+8, dy+24, dx+dw-8, dy+24, rl.NewColor(60, 70, 100, 255))
+
+	type row struct{ key, val string }
+	type section struct {
+		title string
+		rows  []row
+	}
+
+	left := []section{
+		{"Navigation", []row{
+			{"WASD / Arrows", "Scroll map"},
+			{"Mouse wheel", "Scroll vertical"},
+			{"Shift+Wheel", "Scroll horizontal"},
+		}},
+		{"Tools (tile layer)", []row{
+			{"P", "Pencil"},
+			{"F", "Fill / bucket"},
+			{"E", "Eraser"},
+			{"Left drag", "Draw object rect"},
+		}},
+		{"Tile transforms", []row{
+			{"H", "Flip horizontal"},
+			{"V", "Flip vertical"},
+			{"R / Shift+R", "Rotate CW / CCW"},
+			{"Right-click", "Pick tile from layer"},
+		}},
+	}
+	right := []section{
+		{"Map", []row{
+			{"Ctrl+S", "Save"},
+			{"G", "Toggle grid"},
+			{"F1 / Esc", "Close this help"},
+		}},
+		{"Layers", []row{
+			{"Dbl-click name", "Rename layer"},
+		}},
+		{"Objects (object layer)", []row{
+			{"Drag on map", "Draw rect object"},
+			{"Dbl-click name", "Rename object"},
+			{"Dbl-click #id", "Edit object ID"},
+		}},
+		{"Tileset panel", []row{
+			{"Click tile", "Select tile"},
+			{"Scroll wheel", "Scroll tileset"},
+		}},
+	}
+
+	drawCol := func(sections []section, cx, cy int32) {
+		x := cx
+		y := cy
+		for _, sec := range sections {
+			rl.DrawText(sec.title, x, y, 9, headCol)
+			y += 13
+			for _, r := range sec.rows {
+				kw := rl.MeasureText(r.key, 8)
+				rl.DrawText(r.key, x+80-kw, y, 8, keyCol)
+				rl.DrawText(r.val, x+86, y, 8, valCol)
+				y += 12
+			}
+			y += 5
+		}
+	}
+
+	colY := dy + 32
+	drawCol(left, dx+10, colY)
+	drawCol(right, dx+dw/2+10, colY)
+
+	rl.DrawText("F1 or Esc to close", dx+(dw-rl.MeasureText("F1 or Esc to close", 9))/2, dy+dh-14, 9, dimCol)
 }
 
 // ── toolbar ───────────────────────────────────────────────────────────────────
@@ -889,7 +1143,9 @@ func drawMapToolbar(s *mapState) {
 
 	if raygui.Button(rl.NewRectangle(4, 4, 44, 20), "Save") && !blocked {
 		if s.mapPath != "" {
-			_ = saveMapTMJ(s, s.mapPath)
+			if err := saveMapTMJ(s, s.mapPath); err == nil {
+				s.notify("Saved " + filepath.Base(s.mapPath))
+			}
 			refreshMapFileList(s)
 		} else {
 			s.saveActive = true
@@ -902,7 +1158,6 @@ func drawMapToolbar(s *mapState) {
 		s.layers = defaultLayers(s.mapW, s.mapH)
 		s.activeLayer = 0
 		s.scrollX, s.scrollY = 0, 0
-		s.nextObjID = 1
 	}
 	if raygui.Button(rl.NewRectangle(256, 4, 50, 20), "Resize") && !blocked {
 		s.resize.active = true
@@ -910,6 +1165,9 @@ func drawMapToolbar(s *mapState) {
 		s.resize.hText = strconv.Itoa(s.mapH)
 		s.resize.focusW = true
 	}
+
+	// Grid toggle — right-aligned in toolbar
+	raygui.CheckBox(rl.NewRectangle(float32(virtualW-52), 7, 14, 14), "Grid", &s.showGrid)
 
 	if blocked {
 		raygui.SetState(raygui.STATE_NORMAL)
@@ -921,6 +1179,7 @@ func drawMapToolbar(s *mapState) {
 func drawMapViewport(s *mapState) {
 	rl.DrawRectangle(drawAreaX, drawAreaY, drawAreaSz, drawAreaSz, rl.NewColor(18, 18, 24, 255))
 	drawMapTileLayers(s)
+	drawMapObjectLayers(s)
 
 	cellSz := int32(0)
 	if s.tileSize > 0 && s.zoom > 0 {
@@ -977,20 +1236,44 @@ func drawMapViewportScrollbars(s *mapState) {
 
 	trackCol := rl.NewColor(35, 35, 48, 255)
 	thumbCol := rl.NewColor(85, 110, 160, 255)
+	mouse := rl.GetMousePosition()
 
 	// Vertical scrollbar in the right gap (drawAreaX+drawAreaSz … panelX)
 	if s.mapH > visH {
 		tx := drawAreaX + drawAreaSz + 1
 		ty := drawAreaY
 		th := drawAreaSz
+		sbW := int32(4)
 		maxSc := int32(s.mapH - visH)
 		thumbH := int32(th) * int32(visH) / int32(s.mapH)
 		if thumbH < 8 {
 			thumbH = 8
 		}
+		if s.vSbDrag {
+			if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+				newY := mouse.Y - s.vSbDragOff
+				if newY < float32(ty) {
+					newY = float32(ty)
+				}
+				if maxY := float32(ty + th - thumbH); newY > maxY {
+					newY = maxY
+				}
+				if th-thumbH > 0 {
+					s.scrollY = int(float32(maxSc) * (newY - float32(ty)) / float32(th-thumbH))
+				}
+				s.clampScroll()
+			} else {
+				s.vSbDrag = false
+			}
+		}
 		thumbY := ty + int32(s.scrollY)*(int32(th)-thumbH)/maxSc
-		rl.DrawRectangle(tx, ty, 2, th, trackCol)
-		rl.DrawRectangle(tx, thumbY, 2, thumbH, thumbCol)
+		hitR := rl.NewRectangle(float32(tx)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
+		if !s.vSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+			s.vSbDrag = true
+			s.vSbDragOff = mouse.Y - float32(thumbY)
+		}
+		rl.DrawRectangle(tx, ty, sbW, th, trackCol)
+		rl.DrawRectangle(tx, thumbY, sbW, thumbH, thumbCol)
 	}
 
 	// Horizontal scrollbar in the bottom gap (drawAreaY+drawAreaSz … mapBelowLayersY)
@@ -998,14 +1281,37 @@ func drawMapViewportScrollbars(s *mapState) {
 		ty := drawAreaY + drawAreaSz + 1
 		tx := drawAreaX
 		tw := drawAreaSz
+		sbH := int32(3)
 		maxSc := int32(s.mapW - visW)
 		thumbW := int32(tw) * int32(visW) / int32(s.mapW)
 		if thumbW < 8 {
 			thumbW = 8
 		}
+		if s.hSbDrag {
+			if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+				newX := mouse.X - s.hSbDragOff
+				if newX < float32(tx) {
+					newX = float32(tx)
+				}
+				if maxX := float32(tx + tw - thumbW); newX > maxX {
+					newX = maxX
+				}
+				if tw-thumbW > 0 {
+					s.scrollX = int(float32(maxSc) * (newX - float32(tx)) / float32(tw-thumbW))
+				}
+				s.clampScroll()
+			} else {
+				s.hSbDrag = false
+			}
+		}
 		thumbX := tx + int32(s.scrollX)*(int32(tw)-thumbW)/maxSc
-		rl.DrawRectangle(tx, ty, tw, 2, trackCol)
-		rl.DrawRectangle(thumbX, ty, thumbW, 2, thumbCol)
+		hitR := rl.NewRectangle(float32(thumbX), float32(ty)-2, float32(thumbW), float32(sbH)+4)
+		if !s.hSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+			s.hSbDrag = true
+			s.hSbDragOff = mouse.X - float32(thumbX)
+		}
+		rl.DrawRectangle(tx, ty, tw, sbH, trackCol)
+		rl.DrawRectangle(thumbX, ty, thumbW, sbH, thumbCol)
 	}
 }
 
@@ -1071,6 +1377,79 @@ func drawMapTileLayers(s *mapState) {
 	}
 }
 
+// ── object layer rendering ────────────────────────────────────────────────────
+
+var objLayerPalette = []rl.Color{
+	rl.NewColor(255, 100, 100, 255),
+	rl.NewColor(100, 220, 100, 255),
+	rl.NewColor(100, 160, 255, 255),
+	rl.NewColor(255, 210, 50, 255),
+	rl.NewColor(210, 100, 255, 255),
+	rl.NewColor(50, 220, 220, 255),
+	rl.NewColor(255, 150, 50, 255),
+	rl.NewColor(180, 180, 180, 255),
+}
+
+func objLayerColor(layerIdx int) rl.Color {
+	return objLayerPalette[layerIdx%len(objLayerPalette)]
+}
+
+func drawMapObjectLayers(s *mapState) {
+	if s.tileSize <= 0 || s.zoom <= 0 {
+		return
+	}
+	cellSz := float32(s.tileSize * s.zoom)
+
+	// Draw bottom-up (last layer first) so upper layers appear on top.
+	for li := len(s.layers) - 1; li >= 0; li-- {
+		layer := s.layers[li]
+		if !layer.visible || layer.kind != layerKindObject {
+			continue
+		}
+		c := objLayerColor(li)
+		fill := rl.NewColor(c.R, c.G, c.B, 45)
+		border := rl.NewColor(c.R, c.G, c.B, 200)
+		label := rl.NewColor(c.R, c.G, c.B, 230)
+		for _, obj := range layer.objects {
+			if obj.Width == 0 && obj.Height == 0 {
+				continue
+			}
+			sx := int32(float32(drawAreaX) + (float32(obj.X)/float32(s.tileSize)-float32(s.scrollX))*cellSz)
+			sy := int32(float32(drawAreaY) + (float32(obj.Y)/float32(s.tileSize)-float32(s.scrollY))*cellSz)
+			sw := int32(float32(obj.Width) / float32(s.tileSize) * cellSz)
+			sh := int32(float32(obj.Height) / float32(s.tileSize) * cellSz)
+			if sx+sw < drawAreaX || sx > drawAreaX+drawAreaSz ||
+				sy+sh < drawAreaY || sy > drawAreaY+drawAreaSz {
+				continue
+			}
+			rl.DrawRectangle(sx, sy, sw, sh, fill)
+			rl.DrawRectangleLines(sx, sy, sw, sh, border)
+			if obj.Name != "" && sw > 8 {
+				rl.DrawText(obj.Name, sx+2, sy+2, 8, label)
+			}
+		}
+	}
+
+	// Drag-preview for a new object being drawn.
+	if s.objDragActive {
+		x0, x1 := s.objDragX0, s.objDragX1
+		y0, y1 := s.objDragY0, s.objDragY1
+		if x0 > x1 {
+			x0, x1 = x1, x0
+		}
+		if y0 > y1 {
+			y0, y1 = y1, y0
+		}
+		sx := int32(float32(drawAreaX) + float32(x0-s.scrollX)*cellSz)
+		sy := int32(float32(drawAreaY) + float32(y0-s.scrollY)*cellSz)
+		sw := int32(float32(x1-x0+1) * cellSz)
+		sh := int32(float32(y1-y0+1) * cellSz)
+		c := objLayerColor(s.activeLayer)
+		rl.DrawRectangle(sx, sy, sw, sh, rl.NewColor(c.R, c.G, c.B, 60))
+		rl.DrawRectangleLines(sx, sy, sw, sh, rl.NewColor(c.R, c.G, c.B, 255))
+	}
+}
+
 // ── layers below drawing area ─────────────────────────────────────────────────
 
 func drawMapBelowLayers(s *mapState) {
@@ -1127,29 +1506,60 @@ func drawMapBelowLayers(s *mapState) {
 				nameCol = rl.NewColor(90, 90, 100, 255)
 			}
 			rl.DrawText(layer.name, listX+40, rowY+5, 10, nameCol)
-			r := rl.NewRectangle(float32(listX+40), float32(rowY), float32(listW-44), float32(mapLayerRowH))
+			// -10 to leave room for the scrollbar
+			r := rl.NewRectangle(float32(listX+40), float32(rowY), float32(listW-50), float32(mapLayerRowH))
 			if rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
-				s.activeLayer = i
-				s.ensureLayerVisible()
+				now := rl.GetTime()
+				if i == s.activeLayer && now-s.layerLastClickTime < 0.4 {
+					s.layerRenameStart()
+				} else {
+					s.activeLayer = i
+					s.renaming = false
+					s.ensureLayerVisible()
+				}
+				s.layerLastClickTime = now
 			}
 		}
 	}
 
-	// Scrollbar (drawn inside list on right edge)
+	// Scrollbar (drawn inside list on right edge, draggable)
 	if len(s.layers) > visRows {
 		trackCol := rl.NewColor(35, 35, 48, 255)
 		thumbCol := rl.NewColor(85, 110, 160, 255)
-		sbX := listX + listW - 4
+		sbX := listX + listW - 7
 		sbY := mapBelowLayersY + 1
 		sbH := mapBelowListH - 2
+		sbW := int32(5)
 		maxSc := int32(len(s.layers) - visRows)
 		thumbH := sbH * int32(visRows) / int32(len(s.layers))
 		if thumbH < 8 {
 			thumbH = 8
 		}
+		if s.layerSbDrag {
+			if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+				newY := mouse.Y - s.layerSbDragOff
+				if newY < float32(sbY) {
+					newY = float32(sbY)
+				}
+				if maxY := float32(sbY + sbH - thumbH); newY > maxY {
+					newY = maxY
+				}
+				if sbH-thumbH > 0 {
+					s.layerScroll = int(float32(maxSc) * (newY - float32(sbY)) / float32(sbH-thumbH))
+				}
+				s.clampLayerScroll()
+			} else {
+				s.layerSbDrag = false
+			}
+		}
 		thumbY := sbY + int32(s.layerScroll)*(sbH-thumbH)/maxSc
-		rl.DrawRectangle(sbX, sbY, 3, sbH, trackCol)
-		rl.DrawRectangle(sbX, thumbY, 3, thumbH, thumbCol)
+		hitR := rl.NewRectangle(float32(sbX)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
+		if !s.layerSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+			s.layerSbDrag = true
+			s.layerSbDragOff = mouse.Y - float32(thumbY)
+		}
+		rl.DrawRectangle(sbX, sbY, sbW, sbH, trackCol)
+		rl.DrawRectangle(sbX, thumbY, sbW, thumbH, thumbCol)
 	}
 
 	bsz := float32(mapBelowBtnH)
@@ -1170,15 +1580,6 @@ func drawMapBelowLayers(s *mapState) {
 	if raygui.Button(rl.NewRectangle(bx, by, bsz, bsz), raygui.IconText(raygui.ICON_ARROW_DOWN, "")) {
 		s.layerMoveDown()
 	}
-	bx += bsz + 6
-	renameW := float32(listX) + float32(listW) - bx
-	if raygui.Button(rl.NewRectangle(bx, by, renameW, bsz), raygui.IconText(raygui.ICON_PENCIL, " Rename")) {
-		if s.renaming {
-			s.layerRenameConfirm()
-		} else {
-			s.layerRenameStart()
-		}
-	}
 }
 
 // ── right panel ───────────────────────────────────────────────────────────────
@@ -1194,6 +1595,280 @@ func mapToolBtn(r rl.Rectangle, icon string, tool, active drawTool) bool {
 }
 
 func drawMapRightPanel(s *mapState) {
+	if s.activeLayer >= 0 && s.activeLayer < len(s.layers) &&
+		s.layers[s.activeLayer].kind == layerKindObject {
+		drawMapObjectPanel(s)
+	} else {
+		drawMapTilePanel(s)
+	}
+}
+
+// ── object panel ──────────────────────────────────────────────────────────────
+
+func drawMapObjectPanel(s *mapState) {
+	const (
+		listY    = int32(mapRTools1Y + 28) // 74
+		rowH     = int32(18)
+		listH    = int32(302) // y=74..376
+		sepY     = listY + listH + 2
+		nameAreaY = sepY + 4
+	)
+	listX := int32(panelX + 4)
+	listW := int32(panelW - 8)
+
+	// Header
+	lw := rl.MeasureText("OBJECTS", 10)
+	rl.DrawText("OBJECTS", panelX+(panelW-lw)/2, mapRToolsLabelY, 10, rl.NewColor(180, 180, 180, 255))
+
+
+	if s.activeLayer >= len(s.layers) {
+		return
+	}
+	layer := &s.layers[s.activeLayer]
+	c := objLayerColor(s.activeLayer)
+
+	// List background
+	rl.DrawRectangle(listX, listY, listW, listH, rl.NewColor(28, 28, 35, 255))
+	rl.DrawRectangleLines(listX, listY, listW, listH, rl.NewColor(65, 65, 80, 255))
+
+	visRows := int(listH / rowH)
+	if s.objListScroll < 0 {
+		s.objListScroll = 0
+	}
+	maxScroll := len(layer.objects) - visRows
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if s.objListScroll > maxScroll {
+		s.objListScroll = maxScroll
+	}
+
+	mouse := rl.GetMousePosition()
+	now := rl.GetTime()
+	for slot := 0; slot < visRows; slot++ {
+		i := s.objListScroll + slot
+		if i >= len(layer.objects) {
+			break
+		}
+		obj := &layer.objects[i]
+		rowY := listY + int32(slot)*rowH
+
+		if i == s.selectedObj {
+			rl.DrawRectangle(listX+1, rowY+1, listW-2, rowH-2, rl.NewColor(55, 80, 130, 255))
+		}
+		// Color dot
+		rl.DrawRectangle(listX+3, rowY+4, 8, rowH-8, rl.NewColor(c.R, c.G, c.B, 200))
+
+		// Delete button (rightmost)
+		delR := rl.NewRectangle(float32(listX+listW-19), float32(rowY+1), 17, float32(rowH-2))
+		if raygui.Button(delR, raygui.IconText(raygui.ICON_CROSS_SMALL, "")) {
+			layer.objects = append(layer.objects[:i], layer.objects[i+1:]...)
+			if s.selectedObj >= len(layer.objects) {
+				s.selectedObj = len(layer.objects) - 1
+			}
+			s.objRenaming = false
+			s.objIDEditing = false
+			break
+		}
+
+		// ID region: fixed-width right of name, before delete button
+		idLabel := fmt.Sprintf("#%d", obj.ID)
+		idW := int32(rl.MeasureText(idLabel, 8)) + 6
+		idX := listX + listW - 20 - idW
+		idRect := rl.NewRectangle(float32(idX), float32(rowY), float32(idW), float32(rowH))
+
+		// Name region: dot + name, left of ID
+		nameRect := rl.NewRectangle(float32(listX), float32(rowY), float32(idX-listX), float32(rowH))
+
+		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			if rl.CheckCollisionPointRec(mouse, nameRect) {
+				if i == s.selectedObj && now-s.lastClickTime < 0.4 && s.lastClickType == 1 {
+					s.objRenaming = true
+					s.objIDEditing = false
+					s.objRenameText = obj.Name
+				} else {
+					s.selectedObj = i
+					s.objRenaming = false
+					s.objIDEditing = false
+				}
+				s.lastClickTime = now
+				s.lastClickType = 1
+			} else if rl.CheckCollisionPointRec(mouse, idRect) {
+				if i == s.selectedObj && now-s.lastClickTime < 0.4 && s.lastClickType == 2 {
+					s.objIDEditing = true
+					s.objRenaming = false
+					s.objIDText = strconv.Itoa(obj.ID)
+				} else {
+					s.selectedObj = i
+					s.objRenaming = false
+					s.objIDEditing = false
+				}
+				s.lastClickTime = now
+				s.lastClickType = 2
+			}
+		}
+
+		// Draw name (or rename edit box)
+		if i == s.selectedObj && s.objRenaming {
+			rl.DrawRectangle(listX+14, rowY+1, idX-listX-14, rowH-2, rl.NewColor(20, 20, 28, 255))
+			rl.DrawRectangleLines(listX+14, rowY+1, idX-listX-14, rowH-2, rl.NewColor(100, 140, 220, 255))
+			rl.DrawText(s.objRenameText+"_", listX+16, rowY+4, 8, rl.White)
+		} else {
+			displayName := obj.Name
+			if displayName == "" {
+				displayName = fmt.Sprintf("obj_%d", obj.ID)
+			}
+			rl.DrawText(displayName, listX+14, rowY+4, 8, rl.NewColor(200, 200, 200, 255))
+		}
+
+		// Draw ID (or ID edit box)
+		if i == s.selectedObj && s.objIDEditing {
+			rl.DrawRectangle(idX, rowY+1, idW, rowH-2, rl.NewColor(20, 20, 28, 255))
+			rl.DrawRectangleLines(idX, rowY+1, idW, rowH-2, rl.NewColor(100, 140, 220, 255))
+			rl.DrawText("#"+s.objIDText+"_", idX+2, rowY+4, 8, rl.White)
+		} else {
+			rl.DrawText(idLabel, idX+3, rowY+4, 8, rl.NewColor(150, 150, 170, 255))
+		}
+	}
+
+	// Scrollbar (draggable)
+	if len(layer.objects) > visRows {
+		trackCol := rl.NewColor(35, 35, 48, 255)
+		thumbCol := rl.NewColor(85, 110, 160, 255)
+		sbX := listX + listW - 7
+		sbY := listY + 1
+		sbH := listH - 2
+		sbW := int32(5)
+		maxSc := int32(len(layer.objects) - visRows)
+		thumbH := sbH * int32(visRows) / int32(len(layer.objects))
+		if thumbH < 8 {
+			thumbH = 8
+		}
+		if s.objSbDrag {
+			if rl.IsMouseButtonDown(rl.MouseButtonLeft) {
+				newY := mouse.Y - s.objSbDragOff
+				if newY < float32(sbY) {
+					newY = float32(sbY)
+				}
+				if maxY := float32(sbY + sbH - thumbH); newY > maxY {
+					newY = maxY
+				}
+				if sbH-thumbH > 0 {
+					s.objListScroll = int(float32(maxSc) * (newY - float32(sbY)) / float32(sbH-thumbH))
+				}
+			} else {
+				s.objSbDrag = false
+			}
+		}
+		thumbY := sbY + int32(s.objListScroll)*(sbH-thumbH)/maxSc
+		hitR := rl.NewRectangle(float32(sbX)-2, float32(thumbY), float32(sbW)+4, float32(thumbH))
+		if !s.objSbDrag && rl.IsMouseButtonPressed(rl.MouseButtonLeft) && rl.CheckCollisionPointRec(mouse, hitR) {
+			s.objSbDrag = true
+			s.objSbDragOff = mouse.Y - float32(thumbY)
+		}
+		rl.DrawRectangle(sbX, sbY, sbW, sbH, trackCol)
+		rl.DrawRectangle(sbX, thumbY, sbW, thumbH, thumbCol)
+	}
+
+	// Separator
+	rl.DrawLine(listX, sepY, listX+listW, sepY, rl.NewColor(55, 55, 70, 255))
+
+	// Selected object info (read-only position/size; name/ID edited inline in list)
+	if s.selectedObj >= 0 && s.selectedObj < len(layer.objects) {
+		obj := &layer.objects[s.selectedObj]
+		ny := nameAreaY
+		rl.DrawText(fmt.Sprintf("x:%.0f  y:%.0f", obj.X, obj.Y), listX, ny, 8, rl.NewColor(120, 120, 135, 255))
+		ny += 13
+		rl.DrawText(fmt.Sprintf("w:%.0f  h:%.0f", obj.Width, obj.Height), listX, ny, 8, rl.NewColor(120, 120, 135, 255))
+		ny += 13
+		rl.DrawText("dbl-click name or #id to edit", listX, ny, 8, rl.NewColor(85, 85, 100, 255))
+	}
+}
+
+func nextLayerObjID(layer *mapLayer) int {
+	max := 0
+	for _, obj := range layer.objects {
+		if obj.ID > max {
+			max = obj.ID
+		}
+	}
+	return max + 1
+}
+
+func (s *mapState) createDefaultObject() {
+	if s.activeLayer >= len(s.layers) {
+		return
+	}
+	layer := &s.layers[s.activeLayer]
+	if layer.kind != layerKindObject {
+		return
+	}
+	id := nextLayerObjID(layer)
+	idVal, _ := json.Marshal(id)
+	obj := mapObject{
+		ID:      id,
+		Name:    fmt.Sprintf("Object"),
+		X:       float64(s.scrollX * s.tileSize),
+		Y:       float64(s.scrollY * s.tileSize),
+		Width:   float64(s.tileSize),
+		Height:  float64(s.tileSize),
+		Visible: true,
+		Properties: []tiledProperty{
+			{Name: "id", Type: "int", Value: json.RawMessage(idVal)},
+		},
+	}
+	layer.objects = append(layer.objects, obj)
+	s.selectedObj = len(layer.objects) - 1
+}
+
+func (s *mapState) createObjectFromDrag() {
+	if s.activeLayer >= len(s.layers) {
+		return
+	}
+	layer := &s.layers[s.activeLayer]
+	if layer.kind != layerKindObject {
+		return
+	}
+	x0, x1 := s.objDragX0, s.objDragX1
+	y0, y1 := s.objDragY0, s.objDragY1
+	if x0 > x1 {
+		x0, x1 = x1, x0
+	}
+	if y0 > y1 {
+		y0, y1 = y1, y0
+	}
+	id := nextLayerObjID(layer)
+	idVal, _ := json.Marshal(id)
+	obj := mapObject{
+		ID:      id,
+		Name:    "Object",
+		X:       float64(x0 * s.tileSize),
+		Y:       float64(y0 * s.tileSize),
+		Width:   float64((x1 - x0 + 1) * s.tileSize),
+		Height:  float64((y1 - y0 + 1) * s.tileSize),
+		Visible: true,
+		Properties: []tiledProperty{
+			{Name: "id", Type: "int", Value: json.RawMessage(idVal)},
+		},
+	}
+	layer.objects = append(layer.objects, obj)
+	s.selectedObj = len(layer.objects) - 1
+}
+
+func (s *mapState) objRenameConfirm() {
+	if s.activeLayer >= len(s.layers) {
+		return
+	}
+	layer := &s.layers[s.activeLayer]
+	if s.selectedObj >= 0 && s.selectedObj < len(layer.objects) {
+		layer.objects[s.selectedObj].Name = s.objRenameText
+	}
+	s.objRenaming = false
+}
+
+// ── tile panel ────────────────────────────────────────────────────────────────
+
+func drawMapTilePanel(s *mapState) {
 	const bsz = float32(24)
 	step := bsz + 4
 
@@ -1237,8 +1912,6 @@ func drawMapRightPanel(s *mapState) {
 	if raygui.Button(rl.NewRectangle(x, y2, bsz, bsz), raygui.IconText(raygui.ICON_ROTATE, "")) {
 		s.tileRotation = (s.tileRotation + 3) & 3
 	}
-	x += step + 8
-	raygui.CheckBox(rl.NewRectangle(x, y2+5, 14, 14), "Grid", &s.showGrid)
 
 	// Tile preview – 32×32 box at the right edge of the tools section
 	const prevSz = int32(32)
@@ -1273,6 +1946,11 @@ func drawMapRightPanel(s *mapState) {
 
 func drawMapTilesetDropdown(s *mapState) {
 	if s.resize.active || s.saveActive || s.mapDropEdit {
+		return
+	}
+	// Only visible in tile-layer mode
+	if s.activeLayer >= 0 && s.activeLayer < len(s.layers) &&
+		s.layers[s.activeLayer].kind == layerKindObject {
 		return
 	}
 	dropX := float32(panelX + 4)
@@ -1534,6 +2212,7 @@ func commitMapSave(s *mapState) {
 		s.mapPath = path
 		s.saveActive = false
 		refreshMapFileList(s)
+		s.notify("Saved " + filepath.Base(path))
 	}
 }
 
@@ -1565,6 +2244,34 @@ func drawMapStatusBar(s *mapState) {
 	status := fmt.Sprintf("Map: %dx%d  Tile: %dpx  Layer: %s  Grid: %s  Tool: %s  Tile#: %d%s",
 		s.mapW, s.mapH, s.tileSize, layerName, gridStr, toolStr, s.selectedTile, cursorStr)
 	rl.DrawText(status, 4, y+5, 10, rl.LightGray)
+}
+
+// ── toast notification ────────────────────────────────────────────────────────
+
+func (s *mapState) notify(msg string) {
+	s.toast.msg = msg
+	s.toast.until = float64(rl.GetTime()) + 1.6
+}
+
+func drawMapNotification(s *mapState) {
+	now := float64(rl.GetTime())
+	if now >= s.toast.until {
+		return
+	}
+	remaining := s.toast.until - now
+	alpha := uint8(255)
+	if remaining < 0.35 {
+		alpha = uint8(remaining / 0.35 * 255)
+	}
+	msg := s.toast.msg
+	tw := rl.MeasureText(msg, 11)
+	pw := tw + 24
+	ph := int32(20)
+	npx := (virtualW - int32(pw)) / 2
+	npy := virtualH - statusBarH - ph - 5
+	rl.DrawRectangle(npx, npy, int32(pw), ph, rl.NewColor(30, 58, 105, alpha))
+	rl.DrawRectangleLines(npx, npy, int32(pw), ph, rl.NewColor(70, 118, 210, alpha))
+	rl.DrawText(msg, npx+12, npy+4, 11, rl.NewColor(220, 235, 255, alpha))
 }
 
 // ── scroll-key and tile drawing helpers ───────────────────────────────────────
@@ -1685,6 +2392,10 @@ func handleMapInput(s *mapState, dt float64) {
 		handleMapRenameInput(s)
 		return
 	}
+	if s.objRenaming || s.objIDEditing {
+		handleMapObjRenameInput(s)
+		return
+	}
 	if s.showHelp {
 		if rl.IsKeyPressed(rl.KeyF1) || rl.IsKeyPressed(rl.KeyEscape) {
 			s.showHelp = false
@@ -1724,8 +2435,8 @@ func handleMapInput(s *mapState, dt float64) {
 
 	shift := rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift)
 
-	// Tile drawing and right-click pick — only when cursor is over a valid map cell
-	if s.hoverValid {
+	// Tile drawing and right-click pick — only when cursor is over a valid map cell and no scrollbar is held
+	if s.hoverValid && !s.isSbDragging() {
 		layer := -1
 		if s.activeLayer < len(s.layers) {
 			layer = s.activeLayer
@@ -1785,6 +2496,28 @@ func handleMapInput(s *mapState, dt float64) {
 				}
 			}
 		}
+		// Object drag-to-draw: start on mouse-down over an object layer
+		if layer >= 0 && s.layers[layer].kind == layerKindObject {
+			if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && !s.objDragActive {
+				s.objDragActive = true
+				s.objDragX0 = s.hoverX
+				s.objDragY0 = s.hoverY
+				s.objDragX1 = s.hoverX
+				s.objDragY1 = s.hoverY
+			}
+		}
+	}
+
+	// Object drag: update end position while hovering, finish on release
+	if s.objDragActive {
+		if s.hoverValid {
+			s.objDragX1 = s.hoverX
+			s.objDragY1 = s.hoverY
+		}
+		if rl.IsMouseButtonReleased(rl.MouseButtonLeft) {
+			s.createObjectFromDrag()
+			s.objDragActive = false
+		}
 	}
 
 	if rl.IsKeyPressed(rl.KeyG) {
@@ -1815,12 +2548,88 @@ func handleMapInput(s *mapState, dt float64) {
 	// Ctrl+S
 	if ctrl && rl.IsKeyPressed(rl.KeyS) {
 		if s.mapPath != "" {
-			_ = saveMapTMJ(s, s.mapPath)
+			if err := saveMapTMJ(s, s.mapPath); err == nil {
+				s.notify("Saved " + filepath.Base(s.mapPath))
+			}
 		} else {
 			s.saveActive = true
 			s.saveFilename = ""
 		}
 	}
+}
+
+func handleMapObjRenameInput(s *mapState) {
+	if s.objIDEditing {
+		if rl.IsKeyPressed(rl.KeyEnter) {
+			s.confirmObjIDEdit()
+			return
+		}
+		if rl.IsKeyPressed(rl.KeyEscape) {
+			s.objIDEditing = false
+			return
+		}
+		if rl.IsKeyPressed(rl.KeyBackspace) && len(s.objIDText) > 0 {
+			s.objIDText = s.objIDText[:len(s.objIDText)-1]
+		}
+		for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+			if c >= '0' && c <= '9' && len(s.objIDText) < 6 {
+				s.objIDText += string(c)
+			}
+		}
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyEnter) {
+		s.objRenameConfirm()
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		s.objRenaming = false
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyBackspace) && len(s.objRenameText) > 0 {
+		r := []rune(s.objRenameText)
+		s.objRenameText = string(r[:len(r)-1])
+	}
+	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+		if len(s.objRenameText) < 64 {
+			s.objRenameText += string(c)
+		}
+	}
+}
+
+func (s *mapState) confirmObjIDEdit() {
+	if s.activeLayer >= len(s.layers) {
+		s.objIDEditing = false
+		return
+	}
+	layer := &s.layers[s.activeLayer]
+	if s.selectedObj < 0 || s.selectedObj >= len(layer.objects) {
+		s.objIDEditing = false
+		return
+	}
+	newID, err := strconv.Atoi(s.objIDText)
+	if err != nil || newID <= 0 {
+		s.objIDEditing = false
+		return
+	}
+	// Reject if another object in this layer already uses this ID
+	for i, obj := range layer.objects {
+		if i != s.selectedObj && obj.ID == newID {
+			s.objIDEditing = false
+			return
+		}
+	}
+	obj := &layer.objects[s.selectedObj]
+	obj.ID = newID
+	// Keep the "id" property in sync
+	for i, p := range obj.Properties {
+		if p.Name == "id" {
+			idVal, _ := json.Marshal(newID)
+			obj.Properties[i].Value = json.RawMessage(idVal)
+			break
+		}
+	}
+	s.objIDEditing = false
 }
 
 func handleMapRenameInput(s *mapState) {
