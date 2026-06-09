@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	rl "github.com/gen2brain/raylib-go/raylib"
 	"github.com/gen2brain/raylib-go/raygui"
+	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
 // ── virtual canvas ────────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ const (
 
 	drawAreaX  = int32(4)
 	drawAreaY  = toolbarH + 4 // 32
-	drawAreaSz = int32(320) // screen pixels for the single-tile editing area
+	drawAreaSz = int32(320)   // screen pixels for the single-tile editing area
 )
 
 // ── right panel layout ────────────────────────────────────────────────────────
@@ -40,11 +40,11 @@ const (
 	swatchGap = int32(2)
 	// Palette swatches centred in the right panel (same centre as the sheet preview).
 	palStartX = panelX + (panelW-palCols*(swatchSz+swatchGap)+swatchGap)/2 // 379
-	palStartY = drawAreaY + 14 // below "PALETTE" label
+	palStartY = drawAreaY + 14                                             // below "PALETTE" label
 
 	// Sheet preview (below palette)
-	previewSz = int32(192) // kept for previewX; actual render size comes from previewLayout()
-	previewX  = panelX + (panelW-previewSz)/2
+	previewSz    = int32(192) // kept for previewX; actual render size comes from previewLayout()
+	previewX     = panelX + (panelW-previewSz)/2
 	sheetTabY    = int32(178) // preview bottom = 198+256=454, leaving 6px gap to status bar
 	sheetTabH    = int32(18)
 	previewGridY = sheetTabY + sheetTabH + 2 // where tiles start: 222
@@ -141,10 +141,11 @@ type gfxState struct {
 	activeQuadrant int // 0–3 maps to sheet quadrants 1–4
 	sheetSz        int // actual image width/height in pixels
 	activeTool     drawTool
-	clipboard      []rl.Color // nil = empty
+	clipboard      []rl.Color         // nil = empty
+	clipboardFlags uint8              // tile flags saved alongside clipboard pixels
 	iconCCW        rl.RenderTexture2D // ROTATE_FILL icon pre-rendered for H-flip
 	dialog         saveDialog
-	texDirty       bool // image was modified; texture needs uploading before next draw
+	texDirty       bool          // image was modified; texture needs uploading before next draw
 	tileFlags      map[int]uint8 // tile index → 8-bit flag mask; zero entries omitted
 	showHelp       bool
 	toast          struct {
@@ -250,6 +251,9 @@ func runGfx(args []string) error {
 
 	refreshFileList(state)
 	loadTileMeta(state)
+	if filename == "" && len(state.fileList) > 0 && state.fileList[0] != filepath.Base(state.imgPath) {
+		loadGfxFile(state, state.fileList[0])
+	}
 
 	canvas := rl.LoadRenderTexture(virtualW, virtualH)
 	defer rl.UnloadRenderTexture(canvas)
@@ -753,7 +757,7 @@ func drawStatusBar(s *gfxState) {
 		symStr = "on"
 	}
 	status := fmt.Sprintf(
-		"Sheet: %dpx  Tile: %dpx  #%d (%d,%d)/%d  Flags: 0x%02X  |  Grid: %s  Sym: %s  Tool: [P/F/E]",
+		"Sheet: %dpx  Tile: %dpx  #%d (%d,%d)/%d  Flags: 0x%02X  |  Grid: %s [g]  Symmetry: %s [+]",
 		s.sheetSz, s.tileSize, s.tileIndex(), s.tileX, s.tileY, s.tileCount()-1,
 		s.tileFlags[s.tileIndex()],
 		gridStr, symStr,
@@ -1170,6 +1174,7 @@ func (s *gfxState) tileCopy() {
 			s.clipboard[row*sz+col] = rl.GetImageColor(*s.img, int32(ox+col), int32(oy+row))
 		}
 	}
+	s.clipboardFlags = s.tileFlags[s.tileIndex()]
 }
 
 func (s *gfxState) tileCut() {
@@ -1188,6 +1193,12 @@ func (s *gfxState) tilePaste() {
 			rl.ImageDrawPixel(s.img, int32(ox+col), int32(oy+row), s.clipboard[row*sz+col])
 		}
 	}
+	id := s.tileIndex()
+	if s.clipboardFlags != 0 {
+		s.tileFlags[id] = s.clipboardFlags
+	} else {
+		delete(s.tileFlags, id)
+	}
 	s.texDirty = true
 }
 
@@ -1200,6 +1211,7 @@ func (s *gfxState) tileClear() {
 			rl.ImageDrawPixel(s.img, int32(ox+col), int32(oy+row), blank)
 		}
 	}
+	delete(s.tileFlags, s.tileIndex())
 	s.texDirty = true
 }
 
