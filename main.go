@@ -32,7 +32,7 @@ func main() {
 	case "clean":
 		err = runClean()
 	case "refresh":
-		err = runRefresh()
+		err = runRefresh(os.Args[2:])
 	case "gfx":
 		err = runGfx(os.Args[2:])
 	case "map":
@@ -66,7 +66,7 @@ func printUsage() {
 	fmt.Printf("  %s serve [--port N]  Serve dist/www with the headers required for SharedArrayBuffer (default port 8000)\n", bin)
 	fmt.Printf("  %s run               Launch the game in the current directory with love/love2d\n", bin)
 	fmt.Printf("  %s watch             Watch .lua files and assets/ and auto-restart the game on changes\n", bin)
-	fmt.Printf("  %s refresh            Add missing template files; prompt to replace existing ones\n", bin)
+	fmt.Printf("  %s refresh [--yes]    Add missing template files; prompt to replace existing ones (--yes skips prompts)\n", bin)
 	fmt.Printf("  %s gfx [file]         Open sprite editor (file resolved under assets/gfx/)\n", bin)
 	fmt.Printf("  %s map [file]         Open map editor\n", bin)
 	fmt.Printf("  %s clean             Remove dist directory\n", bin)

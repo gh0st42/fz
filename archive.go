@@ -34,17 +34,35 @@ func createLoveArchive(rootDir, archivePath string) error {
 		}
 
 		relPath = filepath.Clean(relPath)
+		base := d.Name()
 
-		for _, skip := range []string{"dist", ".git"} {
-			if relPath == skip || strings.HasPrefix(relPath, skip+string(filepath.Separator)) {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
+		// Skip entire directory trees that should never ship.
+		if d.IsDir() {
+			switch base {
+			case "dist", ".git", "node_modules", ".idea", ".vscode":
+				return filepath.SkipDir
 			}
+			if strings.HasPrefix(base, ".") {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
-		if d.IsDir() {
+		// Skip file-level noise regardless of directory.
+		switch base {
+		case ".DS_Store", "Thumbs.db", "desktop.ini":
+			return nil
+		}
+		// Skip hidden files, editor swap/backup files, and .love archives at root.
+		if strings.HasPrefix(base, ".") {
+			return nil
+		}
+		if strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".bak") ||
+			strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") {
+			return nil
+		}
+		// Don't bundle .love files that happen to live in the project root.
+		if filepath.Dir(relPath) == "." && strings.HasSuffix(strings.ToLower(base), ".love") {
 			return nil
 		}
 

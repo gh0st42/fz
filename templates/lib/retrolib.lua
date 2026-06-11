@@ -304,6 +304,66 @@ function retrolib.fget(meta, tile_id, bit_index)
   return math.floor(mask / (2 ^ bit_index)) % 2 == 1
 end
 
+-- ─── Audio ────────────────────────────────────────────────────────────────────
+
+-- Internal state
+local _sfx_sources = {}  -- cached Source objects keyed by path
+local _bgm_source  = nil -- currently playing BGM Source (or nil)
+
+--- Play a sound effect once.
+-- path is relative to the Love2D source directory (e.g. "assets/sfx/jump.wav").
+-- The source is cached after the first call so subsequent calls are cheap.
+function retrolib.sfx(path)
+  local src = _sfx_sources[path]
+  if not src then
+    src = love.audio.newSource(path, "static")
+    _sfx_sources[path] = src
+  end
+  src:stop()
+  src:play()
+end
+
+--- Start background music.
+-- path is relative to the Love2D source directory (e.g. "assets/bgm/theme.ogg").
+-- loop defaults to true.  Calling bgm() again with the same path is a no-op if
+-- music is already playing; pass a different path to switch tracks (stop + start).
+function retrolib.bgm(path, loop)
+  if loop == nil then loop = true end
+  -- Already playing the same track — do nothing.
+  if _bgm_source and _bgm_source._path == path and _bgm_source:isPlaying() then
+    return
+  end
+  -- Stop previous track.
+  if _bgm_source then
+    _bgm_source:stop()
+    _bgm_source = nil
+  end
+  if not path then return end
+  local src = love.audio.newSource(path, "stream")
+  src:setLooping(loop)
+  src._path = path
+  src:play()
+  _bgm_source = src
+end
+
+--- Stop background music.
+function retrolib.bgm_stop()
+  if _bgm_source then
+    _bgm_source:stop()
+    _bgm_source = nil
+  end
+end
+
+--- Pause or resume background music.
+function retrolib.bgm_pause(paused)
+  if not _bgm_source then return end
+  if paused then
+    _bgm_source:pause()
+  else
+    _bgm_source:play()
+  end
+end
+
 -- ─── Lifecycle / main loop ────────────────────────────────────────────────────
 
 local function _init_graphics()

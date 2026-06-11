@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-13
+            goos: darwin
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install dependencies (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxinerama-dev libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+
+      - name: Set up MinGW (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          EXT=""
+          [[ "${{ matrix.goos }}" == "windows" ]] && EXT=".exe"
+          go build -trimpath -ldflags="-s -w" \
+            -o "fz-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fz-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: fz-*
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/fz-*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

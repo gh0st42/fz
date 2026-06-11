@@ -1495,7 +1495,7 @@ func drawMapScene(s *mapState) {
 func drawMapHelpOverlay() {
 	const (
 		dw = int32(460)
-		dh = int32(340)
+		dh = int32(352)
 	)
 	dx := (virtualW - dw) / 2
 	dy := (virtualH - dh) / 2
@@ -1525,6 +1525,8 @@ func drawMapHelpOverlay() {
 			{"WASD / Arrows", "Scroll map"},
 			{"Mouse wheel", "Scroll vertical"},
 			{"Shift+Wheel", "Scroll horizontal"},
+			{"+  /  -", "Zoom in / out"},
+			{"Ctrl+Wheel", "Zoom in / out"},
 		}},
 		{"Tools (tile layer)", []row{
 			{"P", "Pencil"},
@@ -1551,6 +1553,7 @@ func drawMapHelpOverlay() {
 		}},
 		{"Layers", []row{
 			{"Page Up / Down", "Cycle active layer"},
+			{"Space", "Toggle active layer visibility"},
 			{"Dbl-click name", "Rename layer"},
 		}},
 		{"Objects (object layer)", []row{
@@ -2767,8 +2770,8 @@ func drawMapStatusBar(s *mapState) {
 	if s.hoverValid {
 		cursorStr = fmt.Sprintf("  XY: %d,%d", s.hoverX, s.hoverY)
 	}
-	status := fmt.Sprintf("Map: %dx%d  Tile: %dpx  Layer: %s  Grid: %s  Tool: %s  Tile#: %d%s",
-		s.mapW, s.mapH, s.tileSize, layerName, gridStr, toolStr, s.selectedTile, cursorStr)
+	status := fmt.Sprintf("Map: %dx%d  Tile: %dpx  Zoom: %dx  Layer: %s  Grid: %s  Tool: %s  Tile#: %d%s",
+		s.mapW, s.mapH, s.tileSize, s.zoom, layerName, gridStr, toolStr, s.selectedTile, cursorStr)
 	rl.DrawText(status, 4, y+5, 10, rl.LightGray)
 }
 
@@ -2936,8 +2939,10 @@ func handleMapInput(s *mapState, dt float64) {
 		}
 	}
 
-	// Mouse-wheel scroll
-	if wheel := rl.GetMouseWheelMove(); wheel != 0 {
+	ctrl := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
+
+	// Mouse-wheel scroll (skip when Ctrl is held; Ctrl+wheel is handled as zoom below)
+	if wheel := rl.GetMouseWheelMove(); wheel != 0 && !ctrl {
 		mouse := rl.GetMousePosition()
 		mx, my := mouse.X, mouse.Y
 		vx, vy, vw, vh := s.vpRect()
@@ -2959,8 +2964,6 @@ func handleMapInput(s *mapState, dt float64) {
 			s.clampLayerScroll()
 		}
 	}
-
-	ctrl := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 
 	// WASD / arrow key scroll
 	s.handleScrollKeys(dt, ctrl)
@@ -3060,6 +3063,37 @@ func handleMapInput(s *mapState, dt float64) {
 
 	if rl.IsKeyPressed(rl.KeyG) {
 		s.showGrid = !s.showGrid
+	}
+	// Zoom in/out: +/= key or Ctrl+wheel when over viewport
+	zoomIn  := rl.IsKeyPressed(rl.KeyEqual) || rl.IsKeyPressed(rl.KeyKpAdd)
+	zoomOut := rl.IsKeyPressed(rl.KeyMinus) || rl.IsKeyPressed(rl.KeyKpSubtract)
+	if ctrl {
+		if wheel := rl.GetMouseWheelMove(); wheel != 0 {
+			m := rl.GetMousePosition()
+			vx, vy, vw, vh := s.vpRect()
+			if m.X >= float32(vx) && m.X < float32(vx+vw) && m.Y >= float32(vy) && m.Y < float32(vy+vh) {
+				if wheel > 0 {
+					zoomIn = true
+				} else {
+					zoomOut = true
+				}
+			}
+		}
+	}
+	if zoomIn && s.zoom < 4 {
+		s.zoom++
+		s.clampScroll()
+		s.minimapDirty = true
+	}
+	if zoomOut && s.zoom > 1 {
+		s.zoom--
+		s.clampScroll()
+		s.minimapDirty = true
+	}
+	// Space: toggle active layer visibility
+	if rl.IsKeyPressed(rl.KeySpace) && s.activeLayer < len(s.layers) {
+		s.layers[s.activeLayer].visible = !s.layers[s.activeLayer].visible
+		s.minimapDirty = true
 	}
 	if rl.IsKeyPressed(rl.KeyP) {
 		s.activeTool = toolPencil
