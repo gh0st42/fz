@@ -160,6 +160,7 @@ func drawTileTransformed(tex rl.Texture2D, ti, columns, tileSize int, dst rl.Rec
 type mapLayer struct {
 	name    string
 	visible bool
+	class   string
 	kind    layerKind
 	data    []uint32    // tile GIDs (len = mapW*mapH); nil for object layers
 	objects []mapObject // rect objects; nil for tile layers
@@ -184,8 +185,10 @@ type mapState struct {
 
 	layers      []mapLayer
 	activeLayer int
-	renaming    bool
-	renameText  string
+	renaming     bool
+	renameText   string
+	classEditing bool
+	classEditText string
 
 	// Pre-rendered CCW rotation icon (ROTATE_FILL flipped horizontally), same as gfx editor.
 	iconCCW rl.RenderTexture2D
@@ -576,9 +579,9 @@ func defaultLayers(w, h int) []mapLayer {
 	// Index 0 = topmost visual layer (drawn last); last index = bottommost (drawn first).
 	// Draw order in drawMapTileLayers iterates slice in reverse.
 	return []mapLayer{
-		{name: "Above", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
-		{name: "Foreground", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
-		{name: "Background", visible: true, kind: layerKindTile, data: make([]uint32, sz)},
+		{name: "Above", visible: true, class: "top", kind: layerKindTile, data: make([]uint32, sz)},
+		{name: "Foreground", visible: true, class: "bottom", kind: layerKindTile, data: make([]uint32, sz)},
+		{name: "Background", visible: true, class: "bottom", kind: layerKindTile, data: make([]uint32, sz)},
 		{name: "_Events", visible: true, kind: layerKindObject, objects: []mapObject{}},
 		{name: "_Encounters", visible: true, kind: layerKindObject, objects: []mapObject{}},
 	}
@@ -680,7 +683,7 @@ func loadMapTMJ(s *mapState, path string) error {
 	sz := s.mapW * s.mapH
 	s.layers = nil
 	for _, jl := range tm.Layers {
-		layer := mapLayer{name: jl.Name, visible: jl.Visible}
+		layer := mapLayer{name: jl.Name, visible: jl.Visible, class: jl.Class}
 		switch jl.Type {
 		case "tilelayer":
 			layer.kind = layerKindTile
@@ -846,6 +849,11 @@ func saveMapTMJ(s *mapState, path string) error {
 		lset("id", len(s.layers)-ri)
 		lset("name", layer.name)
 		lset("visible", layer.visible)
+		if layer.class != "" {
+			lset("class", layer.class)
+		} else {
+			delete(lm, "class")
+		}
 		lset("x", 0)
 		lset("y", 0)
 		if _, exists := lm["opacity"]; !exists {
@@ -1109,7 +1117,24 @@ func (s *mapState) layerRenameStart() {
 	if s.activeLayer < len(s.layers) {
 		s.renameText = s.layers[s.activeLayer].name
 		s.renaming = true
+		s.classEditing = false
 	}
+}
+
+func (s *mapState) layerClassEditStart() {
+	if s.activeLayer < len(s.layers) {
+		s.classEditText = s.layers[s.activeLayer].class
+		s.classEditing = true
+		s.renaming = false
+	}
+}
+
+func (s *mapState) layerClassEditConfirm() {
+	if s.activeLayer < len(s.layers) {
+		s.layers[s.activeLayer].class = strings.TrimSpace(s.classEditText)
+		s.markDirty()
+	}
+	s.classEditing = false
 }
 
 func (s *mapState) layerRenameConfirm() {
@@ -1992,22 +2017,59 @@ func drawMapBelowLayers(s *mapState) {
 		rl.DrawRectangle(listX+22, rowY+3, 14, 14, badgeCol)
 		rl.DrawText(badgeTxt, listX+25, rowY+5, 9, rl.White)
 
+		// Class tag area: right 68px of the row (before scrollbar margin)
+		classAreaX := listX + listW - 75
+		classAreaW := int32(65)
+
 		if s.renaming && i == s.activeLayer {
-			rl.DrawRectangle(listX+40, rowY+2, listW-44, mapLayerRowH-4, rl.NewColor(20, 20, 28, 255))
-			rl.DrawRectangleLines(listX+40, rowY+2, listW-44, mapLayerRowH-4, rl.NewColor(100, 140, 220, 255))
+			rl.DrawRectangle(listX+40, rowY+2, classAreaX-listX-42, mapLayerRowH-4, rl.NewColor(20, 20, 28, 255))
+			rl.DrawRectangleLines(listX+40, rowY+2, classAreaX-listX-42, mapLayerRowH-4, rl.NewColor(100, 140, 220, 255))
 			rl.DrawText(s.renameText+"_", listX+44, rowY+5, 10, rl.White)
+		} else if s.classEditing && i == s.activeLayer {
+			rl.DrawRectangle(listX+40, rowY+2, classAreaX-listX-42, mapLayerRowH-4, rl.NewColor(20, 20, 28, 255))
+			nameCol := rl.NewColor(200, 200, 200, 255)
+			if !layer.visible {
+				nameCol = rl.NewColor(90, 90, 100, 255)
+			}
+			rl.DrawText(layer.name, listX+40, rowY+5, 10, nameCol)
+			// Class edit input box
+			rl.DrawRectangle(classAreaX, rowY+2, classAreaW, mapLayerRowH-4, rl.NewColor(20, 20, 28, 255))
+			rl.DrawRectangleLines(classAreaX, rowY+2, classAreaW, mapLayerRowH-4, rl.NewColor(100, 200, 120, 255))
+			rl.DrawText(s.classEditText+"_", classAreaX+3, rowY+5, 9, rl.NewColor(120, 220, 140, 255))
 		} else {
 			nameCol := rl.NewColor(200, 200, 200, 255)
 			if !layer.visible {
 				nameCol = rl.NewColor(90, 90, 100, 255)
 			}
 			rl.DrawText(layer.name, listX+40, rowY+5, 10, nameCol)
-			// -10 to leave room for the scrollbar
-			r := rl.NewRectangle(float32(listX+40), float32(rowY), float32(listW-50), float32(mapLayerRowH))
-			if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, r) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			// Class tag
+			if layer.class != "" {
+				rl.DrawRectangle(classAreaX, rowY+3, classAreaW, mapLayerRowH-6, rl.NewColor(40, 55, 40, 255))
+				rl.DrawRectangleLines(classAreaX, rowY+3, classAreaW, mapLayerRowH-6, rl.NewColor(70, 110, 70, 255))
+				cw := rl.MeasureText(layer.class, 9)
+				cx := classAreaX + (classAreaW-cw)/2
+				rl.DrawText(layer.class, cx, rowY+5, 9, rl.NewColor(130, 200, 130, 255))
+			}
+
+			// Name hit area (double-click = rename)
+			nameR := rl.NewRectangle(float32(listX+40), float32(rowY), float32(classAreaX-listX-42), float32(mapLayerRowH))
+			if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, nameR) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 				now := rl.GetTime()
 				if i == s.activeLayer && now-s.layerLastClickTime < 0.4 {
 					s.layerRenameStart()
+				} else {
+					s.activeLayer = i
+					s.classEditing = false
+					s.ensureLayerVisible()
+				}
+				s.layerLastClickTime = now
+			}
+			// Class hit area (double-click = edit class)
+			classR := rl.NewRectangle(float32(classAreaX), float32(rowY), float32(classAreaW), float32(mapLayerRowH))
+			if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, classR) && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+				now := rl.GetTime()
+				if i == s.activeLayer && now-s.layerLastClickTime < 0.4 {
+					s.layerClassEditStart()
 				} else {
 					s.activeLayer = i
 					s.renaming = false
@@ -2902,6 +2964,10 @@ func handleMapInput(s *mapState, dt float64) {
 		handleMapRenameInput(s)
 		return
 	}
+	if s.classEditing {
+		handleMapClassInput(s)
+		return
+	}
 	if s.objRenaming || s.objIDEditing {
 		handleMapObjRenameInput(s)
 		return
@@ -3226,6 +3292,26 @@ func (s *mapState) confirmObjIDEdit() {
 	}
 	s.objIDEditing = false
 	s.markDirty()
+}
+
+func handleMapClassInput(s *mapState) {
+	if rl.IsKeyPressed(rl.KeyEnter) {
+		s.layerClassEditConfirm()
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		s.classEditing = false
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyBackspace) && len(s.classEditText) > 0 {
+		r := []rune(s.classEditText)
+		s.classEditText = string(r[:len(r)-1])
+	}
+	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+		if len(s.classEditText) < 32 {
+			s.classEditText += string(c)
+		}
+	}
 }
 
 func handleMapRenameInput(s *mapState) {

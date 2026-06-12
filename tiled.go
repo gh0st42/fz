@@ -106,6 +106,7 @@ func (o mapObject) MarshalJSON() ([]byte, error) {
 }
 
 type tiledLayerJSON struct {
+	Class     string       `json:"class,omitempty"`
 	Data      []uint32     `json:"data,omitempty"`
 	DrawOrder string       `json:"draworder,omitempty"`
 	Height    int          `json:"height,omitempty"`
