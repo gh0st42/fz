@@ -39,6 +39,10 @@ func main() {
 		err = runMap(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:])
+	case "about":
+		runAbout()
+	case "update":
+		err = runUpdate()
 	case "version", "--version", "-v":
 		fmt.Printf("%s v%s by %s\n", filepath.Base(os.Args[0]), version, toolAuthor)
 		return
@@ -69,6 +73,8 @@ func printUsage() {
 	fmt.Printf("  %s refresh [--yes]    Add missing template files; prompt to replace existing ones (--yes skips prompts)\n", bin)
 	fmt.Printf("  %s gfx [file]         Open sprite editor (file resolved under assets/gfx/)\n", bin)
 	fmt.Printf("  %s map [file]         Open map editor\n", bin)
+	fmt.Printf("  %s about             Show license and third-party attribution\n", bin)
 	fmt.Printf("  %s clean             Remove dist directory\n", bin)
+	fmt.Printf("  %s update            Check for a newer release on GitHub and replace this binary\n", bin)
 	fmt.Printf("  %s version           Print version\n", bin)
 }

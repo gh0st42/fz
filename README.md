@@ -274,9 +274,26 @@ fz map /absolute/path/to/map.tmj   # open any TMJ by absolute path
 - **Multiple tilesets per map are not fully supported.** Only the first tileset entry is loaded. GIDs that belong to a second or later tileset will be looked up against the first sheet, producing wrong tiles. Maps with a single tileset work correctly.
 - Base64-encoded or compressed layer data (Tiled's "zlib", "gzip", "zstd" options) is not decoded; those layers will appear empty.
 
+### `fz about`
+
+Prints the tool's MIT license and full attribution for every bundled dependency: the Go libraries, the vendored C libraries (raylib, GLFW), and the Lua libraries shipped into new projects.
+
 ### `fz clean`
 
 Removes the `dist/` directory.
+
+### `fz update`
+
+Checks the latest release on GitHub and, if a newer version is available, downloads the matching binary for the current platform and replaces the running executable in-place.
+
+```
+$ fz update
+New version available: 0.3.1 → 0.4.0
+Downloading fz-v0.4.0-darwin-arm64 ...
+Updated to 0.4.0.
+```
+
+The binary must be writable by the current user. On systems where it lives in a protected directory (e.g. `/usr/local/bin` installed by root), run with `sudo`. On Windows the current binary is renamed to `fz.exe.old` before the new one is placed — the old file can be deleted afterwards.
 
 ### `fz version`
 
