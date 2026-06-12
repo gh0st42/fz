@@ -911,7 +911,11 @@ func saveTSJMerged(s *mapState) error {
 	}
 
 	set("columns", cols)
-	set("image", filepath.Base(s.tilesetImgPath))
+	imgRef := filepath.Base(s.tilesetImgPath)
+	if rel, err := filepath.Rel(filepath.Dir(s.tilesetTSJPath), s.tilesetImgPath); err == nil {
+		imgRef = filepath.ToSlash(rel)
+	}
+	set("image", imgRef)
 	set("imagewidth", s.sheetSz)
 	set("imageheight", s.sheetSz)
 	set("tilecount", cols*cols)
