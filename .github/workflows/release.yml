@@ -22,9 +22,6 @@ jobs:
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-          - runner: macos-13
-            goos: darwin
-            goarch: amd64
           - runner: macos-latest
             goos: darwin
             goarch: arm64
@@ -84,6 +81,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: dist/fz-*
           generate_release_notes: true
           fail_on_unmatched_files: true
