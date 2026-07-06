@@ -68,7 +68,7 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Printf("  %s new <name>        Create a new Love2D project directory\n", bin)
 	fmt.Printf("  %s init              Initialize a Love2D project in current directory\n", bin)
-	fmt.Printf("  %s build [--web] [--compat]  Build dist/<project>.love; --web also builds dist/www via love.js/npx\n", bin)
+	fmt.Printf("  %s build [--web] [--compat] [--portmaster]  Build dist/<project>.love; --web → dist/www; --portmaster → PortMaster zip\n", bin)
 	fmt.Printf("  %s serve [--port N]  Serve dist/www with the headers required for SharedArrayBuffer (default port 8000)\n", bin)
 	fmt.Printf("  %s run               Launch the game in the current directory with love/love2d\n", bin)
 	fmt.Printf("  %s watch             Watch .lua files and assets/ and auto-restart the game on changes\n", bin)

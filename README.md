@@ -72,6 +72,24 @@ Builds a `.love` archive into `dist/`. Common noise (`node_modules/`, `.git/`, `
 |---|---|
 | `--web` | Also builds a web export into `dist/www/` using love.js (requires Node.js / npx) |
 | `--compat` | Passes `-c` to love.js, building without `SharedArrayBuffer`. Use only when deploying to hosts that block cross-origin isolation headers (e.g. older itch.io embeds) |
+| `--portmaster` | Also builds a PortMaster zip (`dist/<project>.portmaster.zip`) for installation on Linux gaming handhelds |
+
+**PortMaster target**
+
+`fz build --portmaster` produces a zip that follows the PortMaster port layout:
+
+```
+dist/<project>.portmaster.zip
+└── ports/
+    ├── <project>.sh       ← launcher script
+    └── <project>/
+        ├── port.json      ← port metadata (name, author, runtime)
+        └── <project>.love ← bundled game archive
+```
+
+The launcher script uses PortMaster's `pm_runtime` to run the game with the `love-11.5.aarch64.squashfs` runtime, which PortMaster downloads automatically on first launch. Game title and author are read from the project's `conf.lua` and `main.lua`.
+
+To install, copy the zip to your handheld and extract it into the PortMaster ports folder (typically `/roms/ports/`). The port then appears in the PortMaster UI.
 
 **`.distignore`**
 

@@ -13,6 +13,7 @@ func runBuild(args []string) error {
 	fs := flag.NewFlagSet("build", flag.ContinueOnError)
 	web := fs.Bool("web", false, "also build a web version using love.js (requires Node.js / npx)")
 	compat := fs.Bool("compat", false, "use love.js compatibility mode (no SharedArrayBuffer; works on itch.io)")
+	portmaster := fs.Bool("portmaster", false, "also build a PortMaster zip for Linux gaming handhelds")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -41,6 +42,12 @@ func runBuild(args []string) error {
 
 	if *web {
 		if err := runBuildWeb(cwd, projectName, archivePath, *compat); err != nil {
+			return err
+		}
+	}
+
+	if *portmaster {
+		if err := runBuildPortmaster(cwd, projectName, archivePath); err != nil {
 			return err
 		}
 	}
