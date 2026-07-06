@@ -31,6 +31,22 @@ local function path_join(dir, file)
   return path
 end
 
+-- ─── Flip-flag helpers ────────────────────────────────────────────────────────
+
+-- Tiled encodes H/V/D flip flags in the top 3 bits of every GID.
+local FLIP_H = 0x80000000  -- bit 31
+local FLIP_V = 0x40000000  -- bit 30
+local FLIP_D = 0x20000000  -- bit 29 (diagonal / anti-diagonal transpose)
+
+-- Strip the three flip bits from a raw GID and return them separately.
+local function strip_flip_flags(gid)
+  local h, v, d = false, false, false
+  if gid >= FLIP_H then gid = gid - FLIP_H; h = true end
+  if gid >= FLIP_V then gid = gid - FLIP_V; v = true end
+  if gid >= FLIP_D then gid = gid - FLIP_D; d = true end
+  return gid, h, v, d
+end
+
 -- ─── Binary helpers ───────────────────────────────────────────────────────────
 
 -- Decode a little-endian uint32 starting at byte position i (1-based).
@@ -127,9 +143,32 @@ end
 
 --- Draw one sprite from this sheet at world coordinates (x, y).
 -- spr_id is the 0-based local tile index (not a global GID).
-function TileSheet:draw(spr_id, x, y)
+-- flip_h, flip_v, flip_d are the Tiled flip flags (booleans).
+function TileSheet:draw(spr_id, x, y, flip_h, flip_v, flip_d)
   love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(self.texture, self:_get_quad(spr_id), x, y)
+  if not flip_h and not flip_v and not flip_d then
+    love.graphics.draw(self.texture, self:_get_quad(spr_id), x, y)
+    return
+  end
+  local tw = self.data.tilewidth
+  local th = self.data.tileheight
+  local r, sx, sy = 0, 1, 1
+  if flip_d then
+    if     flip_h and flip_v then r, sx, sy = -math.pi / 2,  1, -1  -- anti-transpose
+    elseif flip_h             then r, sx, sy =  math.pi / 2,  1,  1  -- 90° CW
+    elseif flip_v             then r, sx, sy = -math.pi / 2,  1,  1  -- 90° CCW
+    else                           r, sx, sy = -math.pi / 2, -1,  1  -- transpose
+    end
+  else
+    sx = flip_h and -1 or 1
+    sy = flip_v and -1 or 1
+  end
+  love.graphics.push()
+  love.graphics.translate(x + tw / 2, y + th / 2)
+  love.graphics.rotate(r)
+  love.graphics.scale(sx, sy)
+  love.graphics.draw(self.texture, self:_get_quad(spr_id), -tw / 2, -th / 2)
+  love.graphics.pop()
 end
 
 -- ─── TileMap ──────────────────────────────────────────────────────────────────
@@ -170,7 +209,7 @@ function TileMap.new(filename)
     if layer.type == "tilelayer" then
       self.layers[#self.layers + 1] = self:_decode_layer(layer)
     elseif layer.type == "objectgroup" then
-      self.object_layers[layer.name] = layer.objects or {}
+      self.object_layers[layer.name:lower()] = layer.objects or {}
     end
   end
 
@@ -196,15 +235,16 @@ end
 
 --- Find a decoded tile layer by name. Returns nil if not found.
 function TileMap:get_layer(name)
+  local lower = name:lower()
   for _, layer in ipairs(self.layers) do
-    if layer.name == name then return layer end
+    if layer.name:lower() == lower then return layer end
   end
   return nil
 end
 
 --- Return all objects in a named object layer (empty table if missing).
 function TileMap:get_objects(layer_name)
-  return self.object_layers[layer_name] or {}
+  return self.object_layers[layer_name:lower()] or {}
 end
 
 --- Return objects whose "type" field matches obj_type.
@@ -219,16 +259,18 @@ function TileMap:get_objects_by_type(layer_name, obj_type)
 end
 
 --- Resolve a global GID to its TileSheet and local tile id.
--- Returns (sheet, local_id) or (nil, 0) for gid == 0 / invalid.
-function TileMap:_get_sheet_for_gid(gid)
+-- Strips Tiled flip flags before the lookup and returns them as extra values.
+-- Returns (sheet, local_id, flip_h, flip_v, flip_d) or (nil, 0, …) for gid == 0.
+function TileMap:_get_sheet_for_gid(raw_gid)
+  local gid, flip_h, flip_v, flip_d = strip_flip_flags(raw_gid)
   -- Iterate tilesets in reverse so we match the highest firstgid ≤ gid.
   for i = #self.tilesets, 1, -1 do
     local ts = self.tilesets[i]
     if gid >= ts.firstgid then
-      return ts.sheet, gid - ts.firstgid
+      return ts.sheet, gid - ts.firstgid, flip_h, flip_v, flip_d
     end
   end
-  return nil, 0
+  return nil, 0, false, false, false
 end
 
 --- Draw a single decoded layer with optional camera or scroll offset.
@@ -266,7 +308,7 @@ function TileMap:draw_layer(layer_data, offset_x, offset_y, camera)
       local gid = layer_data.data[idx]
 
       if gid and gid ~= 0 then
-        local sheet, local_id = self:_get_sheet_for_gid(gid)
+        local sheet, local_id, flip_h, flip_v, flip_d = self:_get_sheet_for_gid(gid)
         if sheet then
           local tx, ty
           if camera then
@@ -276,7 +318,7 @@ function TileMap:draw_layer(layer_data, offset_x, offset_y, camera)
             tx = col * self.tile_w + offset_x
             ty = row * self.tile_h + offset_y
           end
-          sheet:draw(local_id, tx, ty)
+          sheet:draw(local_id, tx, ty, flip_h, flip_v, flip_d)
         end
       end
     end

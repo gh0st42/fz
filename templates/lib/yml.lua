@@ -37,6 +37,7 @@ local function parse_scalar(raw)
   if v == "true" then return true end
   if v == "false" then return false end
   if v == "null" or v == "~" then return nil end
+  if v == "[]" or v == "{}" then return {} end
 
   local sq = v:match("^'(.*)'$")
   if sq ~= nil then
@@ -180,6 +181,9 @@ local function parse_sequence(lines, i, indent)
           out[#out + 1] = nil
           i = i + 1
         end
+      elseif item_text:match('^"') or item_text:match("^'") then
+        out[#out + 1] = parse_scalar(item_text)
+        i = i + 1
       else
         local key, rest = item_text:match("^([^:]+):%s*(.*)$")
         if key then

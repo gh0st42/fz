@@ -1,5 +1,4 @@
 -- retrolib.lua  –  Retro game helpers for LÖVE2D
--- Drop-in spiritual port of retrolib.py
 --
 -- Usage:
 --   local retrolib = require("retrolib")
@@ -13,7 +12,8 @@ retrolib.SCREEN_WIDTH      = 320
 retrolib.SCREEN_HEIGHT     = 200
 retrolib.SCREEN_TARGET_FPS = 60
 retrolib.WINDOW_TITLE      = "Retrolib"
-retrolib.SCREEN_SCALE      = 3
+retrolib.SCREEN_SCALE      = 4
+retrolib.FONT_PATH         = nil -- set to a TTF path to override the default font
 
 -- ─── Button definitions ───────────────────────────────────────────────────────
 -- keyboard keys use Love2D string names; gamepad buttons use Love2D gamepad names
@@ -25,6 +25,7 @@ retrolib.BTN_A             = { keyboard = { "return", "x" }, gamepad = { "a" }, 
 retrolib.BTN_B             = { keyboard = { "rshift", "y", "z" }, gamepad = { "b" }, dx = 0, dy = 0 }
 retrolib.BTN_X             = { keyboard = { "space", "s" }, gamepad = { "x" }, dx = 0, dy = 0 }
 retrolib.BTN_Y             = { keyboard = { "tab", "a" }, gamepad = { "y" }, dx = 0, dy = 0 }
+retrolib.BTN_START         = { keyboard = { "return" }, gamepad = { "start" }, dx = 0, dy = 0 }
 
 -- ─── Common colors (0-1 normalized, compatible with love.graphics.setColor) ──
 retrolib.WHITE             = { 1, 1, 1, 1 }
@@ -34,115 +35,245 @@ retrolib.GREEN             = { 0, 1, 0, 1 }
 retrolib.BLUE              = { 0, 0, 1, 1 }
 retrolib.YELLOW            = { 1, 1, 0, 1 }
 
+-- ─── Math helpers ─────────────────────────────────────────────────────────────
+
+--- Restricts val to the inclusive range [lo, hi].
+function retrolib.clamp(val, lo, hi)
+    return math.max(lo, math.min(hi, val))
+end
+
+-- ─── Collision helpers ────────────────────────────────────────────────────────
+-- Geometry and collision helpers. All coordinates are in pixels.
+
+function retrolib.point_in_rect(px, py, rx, ry, rw, rh)
+    return px >= rx and px < rx + rw and py >= ry and py < ry + rh
+end
+
+function retrolib.rects_overlap(ax, ay, aw, ah, bx, by, bw, bh)
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+end
+
+function retrolib.point_in_circle(px, py, cx, cy, r)
+    local dx = px - cx
+    local dy = py - cy
+    return dx * dx + dy * dy < r * r
+end
+
+-- Returns dx, dy (one-cell step) in the direction the player is facing.
+function retrolib.direction_delta(direction)
+    if direction == "up" then return 0, -1 end
+    if direction == "down" then return 0, 1 end
+    if direction == "left" then return -1, 0 end
+    if direction == "right" then return 1, 0 end
+    return 0, 0
+end
+
 -- ─── Internal state ───────────────────────────────────────────────────────────
-local _canvas              = nil
-local _font_cache          = {}
-local _pressed_keys        = {} -- keys pressed THIS frame
-local _pressed_buttons     = {} -- gamepad buttons pressed THIS frame
+local _canvas          = nil
+local _font_cache      = {}
+local _pressed_keys    = {} -- keys pressed THIS frame
+local _pressed_buttons = {} -- gamepad buttons pressed THIS frame
+
+local _notify_msg      = nil
+local _notify_until    = 0
+local _notify_area     = "bottom" -- "top", "center" or "bottom" (where to draw the notification text)
 
 -- ─── Input ────────────────────────────────────────────────────────────────────
 
+-- Exit key: nil disables it, a plain key string ("escape") requires just that
+-- key, or a "mod+mod+key" combo ("lctrl+q", "alt+x") requires the modifiers
+-- held down when the final key is pressed. Defaults to "escape".
+local _exit_key_spec   = "escape"
+
+local _MOD_ALIASES     = {
+    ctrl  = { "lctrl", "rctrl" },
+    shift = { "lshift", "rshift" },
+    alt   = { "lalt", "ralt" },
+    gui   = { "lgui", "rgui" },
+    cmd   = { "lgui", "rgui" },
+}
+
+local function _mod_held(name)
+    for _, k in ipairs(_MOD_ALIASES[name] or { name }) do
+        if love.keyboard.isDown(k) then return true end
+    end
+    return false
+end
+
+--- Sets the key (or modifier combo) that quits the app.
+-- Pass a plain Love2D key name ("escape"), a combo string ("lctrl+q", "alt+x"),
+-- or nil to disable the exit key entirely. Defaults to "escape".
+function retrolib.set_exit_key(combo)
+    if combo == nil then
+        _exit_key_spec = nil
+        return
+    end
+    local parts = {}
+    for part in combo:gmatch("[^+]+") do
+        table.insert(parts, part:lower())
+    end
+    local key = table.remove(parts)
+    _exit_key_spec = #parts > 0 and { mods = parts, key = key } or key
+end
+
+local function _exit_key_pressed(key)
+    if not _exit_key_spec then return false end
+    if type(_exit_key_spec) == "string" then
+        return key == _exit_key_spec
+    end
+    if key ~= _exit_key_spec.key then return false end
+    for _, m in ipairs(_exit_key_spec.mods) do
+        if not _mod_held(m) then return false end
+    end
+    return true
+end
+
 --- Returns true while any key/button in btn_data is held.
 function retrolib.btn(btn_data)
-  for _, k in ipairs(btn_data.keyboard) do
-    if love.keyboard.isDown(k) then return true end
-  end
-  local sticks = love.joystick.getJoysticks()
-  if sticks[1] and sticks[1]:isGamepad() then
-    for _, g in ipairs(btn_data.gamepad) do
-      if sticks[1]:isGamepadDown(g) then return true end
+    if type(btn_data) == "string" then
+        return love.keyboard.isDown(btn_data)
     end
-  end
-  return false
+    for _, k in ipairs(btn_data.keyboard) do
+        if love.keyboard.isDown(k) then return true end
+    end
+    local sticks = love.joystick.getJoysticks()
+    if sticks[1] and sticks[1]:isGamepad() then
+        for _, g in ipairs(btn_data.gamepad) do
+            if sticks[1]:isGamepadDown(g) then return true end
+        end
+    end
+    return false
 end
 
 --- Returns true only on the first frame any key/button in btn_data was pressed.
 function retrolib.btnp(btn_data)
-  for _, k in ipairs(btn_data.keyboard) do
-    if _pressed_keys[k] then return true end
-  end
-  for _, g in ipairs(btn_data.gamepad) do
-    if _pressed_buttons[g] then return true end
-  end
-  return false
+    if type(btn_data) == "string" then
+        return _pressed_keys[btn_data]
+    end
+    for _, k in ipairs(btn_data.keyboard) do
+        if _pressed_keys[k] then return true end
+    end
+    for _, g in ipairs(btn_data.gamepad) do
+        if _pressed_buttons[g] then return true end
+    end
+    return false
 end
 
 -- ─── Font helpers ─────────────────────────────────────────────────────────────
 
 local function _get_font(size)
-  if not _font_cache[size] then
-    -- "mono" forces 1-bit monochrome rendering (no anti-aliasing) so glyphs
-    -- have hard edges that stay sharp when the canvas is scaled up.
-    -- Drop a pixel TTF into assets/ and change this path for custom fonts.
-    local f = love.graphics.newFont(size, "mono")
-    f:setFilter("nearest", "nearest")
-    _font_cache[size] = f
-  end
-  return _font_cache[size]
+    local key = (retrolib.FONT_PATH or "") .. tostring(size)
+    if not _font_cache[key] then
+        local f
+        if retrolib.FONT_PATH then
+            f = love.graphics.newFont(retrolib.FONT_PATH, size)
+        else
+            f = love.graphics.newFont(size, "mono")
+        end
+        f:setFilter("nearest", "nearest")
+        _font_cache[key] = f
+    end
+    return _font_cache[key]
 end
 
 --- Returns the pixel width of text rendered at the given font size.
 function retrolib.measure_text(text, size)
-  return _get_font(size):getWidth(text)
+    return _get_font(size):getWidth(text)
+end
+
+--- Returns the pixel width and height of text at the given font size.
+-- Handles multi-line strings: w is the widest line, h is line_height * line_count.
+function retrolib.measure_text_ex(text, size)
+    local font = _get_font(size)
+    local line_h = font:getHeight()
+    local max_w = 0
+    local count = 0
+    for line in ((text or "") .. "\n"):gmatch("(.-)\n") do
+        local w = font:getWidth(line)
+        if w > max_w then max_w = w end
+        count = count + 1
+    end
+    return max_w, line_h * math.max(count, 1)
 end
 
 -- ─── Drawing helpers ──────────────────────────────────────────────────────────
 
 --- Clears the current render target to the given color table {r,g,b,a}.
 function retrolib.clear_background(color)
-  love.graphics.clear(color[1], color[2], color[3], color[4] or 1)
+    love.graphics.clear(color[1], color[2], color[3], color[4] or 1)
 end
 
 --- Draws text at (x,y) using a font of the given pixel size.
 -- color is a table {r,g,b,a} with components in 0-1 range.
+-- if x is -1 center the given text on the screen
 function retrolib.draw_text(text, x, y, size, color)
-  love.graphics.setFont(_get_font(size))
-  love.graphics.setColor(color)
-  love.graphics.print(text, x, y)
-  love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setFont(_get_font(size))
+    love.graphics.setColor(color)
+    local xx = x
+    if xx < 0 then
+        xx = (retrolib.SCREEN_WIDTH - retrolib.measure_text(text, size)) / 2
+    end
+    love.graphics.print(text, xx, y)
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+function retrolib.draw_text_centered(text, y, size, color)
+    love.graphics.setFont(_get_font(size))
+    local w = love.graphics.getFont():getWidth(text)
+    local h = love.graphics.getFont():getHeight()
+    love.graphics.setColor(color)
+    love.graphics.print(text, (retrolib.SCREEN_WIDTH - w) / 2, y)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --- Draws the current FPS counter at (x,y).
 function retrolib.draw_fps(x, y)
-  love.graphics.setFont(_get_font(10))
-  love.graphics.setColor(0, 1, 0, 1)
-  love.graphics.print(tostring(love.timer.getFPS()) .. " FPS", x, y)
-  love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setFont(_get_font(10))
+    love.graphics.setColor(0, 1, 0, 1)
+    love.graphics.print(tostring(love.timer.getFPS()) .. " FPS", x, y)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --- Filled rectangle. color is {r,g,b,a}.
 function retrolib.draw_rectangle(x, y, w, h, color)
-  love.graphics.setColor(color)
-  love.graphics.rectangle("fill", x, y, w, h)
-  love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(color)
+    love.graphics.rectangle("fill", x, y, w, h)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --- Outlined rectangle. color is {r,g,b,a}.
 function retrolib.draw_rectangle_lines(x, y, w, h, color)
-  love.graphics.setColor(color)
-  love.graphics.rectangle("line", x, y, w, h)
-  love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(color)
+    love.graphics.rectangle("line", x, y, w, h)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --- Loads a texture image with nearest-neighbour filtering (pixel-art friendly).
 function retrolib.load_texture(path)
-  local img = love.graphics.newImage(path)
-  img:setFilter("nearest", "nearest")
-  return img
+    local img = love.graphics.newImage(path)
+    img:setFilter("nearest", "nearest")
+    return img
+end
+
+--- Draws a full texture at (x,y) with optional tint color {r,g,b,a}.
+function retrolib.draw_texture(texture, x, y, color)
+    love.graphics.setColor(color or { 1, 1, 1, 1 })
+    love.graphics.draw(texture, x, y)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 --- Draws a single sprite from a texture atlas.
 -- sprite_id is 0-based; square_sprite_size is the tile size in pixels.
 function retrolib.draw_sprite(texture, sprite_id, x, y, square_sprite_size)
-  local iw, ih = texture:getDimensions()
-  local cols   = math.floor(iw / square_sprite_size)
-  local src_x  = (sprite_id % cols) * square_sprite_size
-  local src_y  = math.floor(sprite_id / cols) * square_sprite_size
-  local quad   = love.graphics.newQuad(src_x, src_y,
-    square_sprite_size, square_sprite_size,
-    iw, ih)
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(texture, quad, x, y)
+    local iw, ih = texture:getDimensions()
+    local cols   = math.floor(iw / square_sprite_size)
+    local src_x  = (sprite_id % cols) * square_sprite_size
+    local src_y  = math.floor(sprite_id / cols) * square_sprite_size
+    local quad   = love.graphics.newQuad(src_x, src_y,
+        square_sprite_size, square_sprite_size,
+        iw, ih)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(texture, quad, x, y)
 end
 
 -- ─── Camera (mirrors raylib Camera2D semantics) ───────────────────────────────
@@ -151,93 +282,93 @@ end
 --- Push a 2D camera transform onto the graphics stack.
 -- Equivalent to raylib's BeginMode2D.
 function retrolib.begin_mode_2d(camera)
-  love.graphics.push()
-  love.graphics.translate(camera.offset.x, camera.offset.y)
-  love.graphics.scale(camera.zoom, camera.zoom)
-  love.graphics.translate(-camera.target.x, -camera.target.y)
+    love.graphics.push()
+    love.graphics.translate(camera.offset.x, camera.offset.y)
+    love.graphics.scale(camera.zoom, camera.zoom)
+    love.graphics.translate(-camera.target.x, -camera.target.y)
 end
 
 --- Pop the 2D camera transform. Equivalent to raylib's EndMode2D.
 function retrolib.end_mode_2d()
-  love.graphics.pop()
+    love.graphics.pop()
 end
 
 -- ─── Palette helpers ──────────────────────────────────────────────────────────
 
 --- Returns the Picotron palette color for index idx (0-31) as {r,g,b,a} (0-1).
 function retrolib.pal_picotron(idx)
-  local p = {
-    { 0,   0,  0 }, { 29, 43, 83 }, { 126, 37, 83 }, { 0, 135, 81 },
-    { 171, 82, 54 }, { 95, 87, 79 }, { 194, 195, 199 }, { 255, 241, 232 },
-    { 255, 0,   77 }, { 255, 163, 0 }, { 255, 236, 39 }, { 0, 228, 54 },
-    { 41,  173, 255 }, { 131, 118, 156 }, { 255, 119, 168 }, { 255, 204, 170 },
-    { 41,  24, 20 }, { 17, 29, 53 }, { 66, 33, 54 }, { 18, 83, 89 },
-    { 116, 47, 41 }, { 73, 51, 59 }, { 162, 136, 121 }, { 243, 239, 125 },
-    { 190, 18, 80 }, { 255, 108, 36 }, { 168, 231, 46 }, { 0, 181, 142 },
-    { 6,   90, 181 }, { 117, 70, 101 }, { 255, 110, 204 }, { 255, 157, 129 },
-  }
-  local c = p[idx + 1] or { 0, 0, 0 }
-  return { c[1] / 255, c[2] / 255, c[3] / 255, 1 }
+    local p = {
+        { 0,   0,  0 }, { 29, 43, 83 }, { 126, 37, 83 }, { 0, 135, 81 },
+        { 171, 82, 54 }, { 95, 87, 79 }, { 194, 195, 199 }, { 255, 241, 232 },
+        { 255, 0,   77 }, { 255, 163, 0 }, { 255, 236, 39 }, { 0, 228, 54 },
+        { 41,  173, 255 }, { 131, 118, 156 }, { 255, 119, 168 }, { 255, 204, 170 },
+        { 41,  24, 20 }, { 17, 29, 53 }, { 66, 33, 54 }, { 18, 83, 89 },
+        { 116, 47, 41 }, { 73, 51, 59 }, { 162, 136, 121 }, { 243, 239, 125 },
+        { 190, 18, 80 }, { 255, 108, 36 }, { 168, 231, 46 }, { 0, 181, 142 },
+        { 6,   90, 181 }, { 117, 70, 101 }, { 255, 110, 204 }, { 255, 157, 129 },
+    }
+    local c = p[idx + 1] or { 0, 0, 0 }
+    return { c[1] / 255, c[2] / 255, c[3] / 255, 1 }
 end
 
 -- Internal HSV→RGB (h,s,v in 0-1, returns r,g,b in 0-1)
 local function _hsv_to_rgb(h, s, v)
-  if s == 0 then return v, v, v end
-  local i  = math.floor(h * 6)
-  local f  = h * 6 - i
-  local p2 = v * (1 - s)
-  local q  = v * (1 - f * s)
-  local t  = v * (1 - (1 - f) * s)
-  i        = i % 6
-  if i == 0 then
-    return v, t, p2
-  elseif i == 1 then
-    return q, v, p2
-  elseif i == 2 then
-    return p2, v, t
-  elseif i == 3 then
-    return p2, q, v
-  elseif i == 4 then
-    return t, p2, v
-  else
-    return v, p2, q
-  end
+    if s == 0 then return v, v, v end
+    local i  = math.floor(h * 6)
+    local f  = h * 6 - i
+    local p2 = v * (1 - s)
+    local q  = v * (1 - f * s)
+    local t  = v * (1 - (1 - f) * s)
+    i        = i % 6
+    if i == 0 then
+        return v, t, p2
+    elseif i == 1 then
+        return q, v, p2
+    elseif i == 2 then
+        return p2, v, t
+    elseif i == 3 then
+        return p2, q, v
+    elseif i == 4 then
+        return t, p2, v
+    else
+        return v, p2, q
+    end
 end
 
 --- Returns the VGA Mode 13h palette color for index idx (0-255) as {r,g,b,a} (0-1).
 function retrolib.pal_vga(idx)
-  assert(idx >= 0 and idx <= 255, "pal_vga: index must be 0-255")
+    assert(idx >= 0 and idx <= 255, "pal_vga: index must be 0-255")
 
-  -- First 16: standard EGA/CGA
-  local ega = {
-    { 0,   0, 0 }, { 0, 0, 170 }, { 0, 170, 0 }, { 0, 170, 170 },
-    { 170, 0, 0 }, { 170, 0, 170 }, { 170, 85, 0 }, { 170, 170, 170 },
-    { 85,  85, 85 }, { 85, 85, 255 }, { 85, 255, 85 }, { 85, 255, 255 },
-    { 255, 85, 85 }, { 255, 85, 255 }, { 255, 255, 85 }, { 255, 255, 255 },
-  }
-  if idx < 16 then
-    local c = ega[idx + 1]
-    return { c[1] / 255, c[2] / 255, c[3] / 255, 1 }
-  end
+    -- First 16: standard EGA/CGA
+    local ega = {
+        { 0,   0, 0 }, { 0, 0, 170 }, { 0, 170, 0 }, { 0, 170, 170 },
+        { 170, 0, 0 }, { 170, 0, 170 }, { 170, 85, 0 }, { 170, 170, 170 },
+        { 85,  85, 85 }, { 85, 85, 255 }, { 85, 255, 85 }, { 85, 255, 255 },
+        { 255, 85, 85 }, { 255, 85, 255 }, { 255, 255, 85 }, { 255, 255, 255 },
+    }
+    if idx < 16 then
+        local c = ega[idx + 1]
+        return { c[1] / 255, c[2] / 255, c[3] / 255, 1 }
+    end
 
-  -- 16-31: greyscale ramp
-  if idx <= 31 then
-    local s = (idx - 16) * (1 / 15)
-    return { s, s, s, 1 }
-  end
+    -- 16-31: greyscale ramp
+    if idx <= 31 then
+        local s = (idx - 16) * (1 / 15)
+        return { s, s, s, 1 }
+    end
 
-  -- 32-247: 24-hue × 3-intensity block
-  if idx <= 247 then
-    local offset  = idx - 32
-    local row     = math.floor(offset / 24)
-    local col     = offset % 24
-    local mult    = ({ 1.0, 0.5, 0.25 })[row + 1] or 0.25
-    local r, g, b = _hsv_to_rgb(col / 24.0, 1.0, 1.0)
-    return { r * mult, g * mult, b * mult, 1 }
-  end
+    -- 32-247: 24-hue × 3-intensity block
+    if idx <= 247 then
+        local offset  = idx - 32
+        local row     = math.floor(offset / 24)
+        local col     = offset % 24
+        local mult    = ({ 1.0, 0.5, 0.25 })[row + 1] or 0.25
+        local r, g, b = _hsv_to_rgb(col / 24.0, 1.0, 1.0)
+        return { r * mult, g * mult, b * mult, 1 }
+    end
 
-  -- 248-255: black/unused
-  return { 0, 0, 0, 1 }
+    -- 248-255: black/unused
+    return { 0, 0, 0, 1 }
 end
 
 -- ─── Tile flags (fz_meta PNG chunk) ──────────────────────────────────────────
@@ -246,15 +377,15 @@ end
 -- Keys are 0-based tile indices (strings); values are uint8 bitmasks (0-255).
 
 local _json = (function()
-  local ok, m = pcall(require, "lib.3pp.json")
-  return ok and m or nil
+    local ok, m = pcall(require, "lib.3pp.json")
+    return ok and m or nil
 end)()
 
 local function _u32be(s, i)
-  return string.byte(s, i)   * 0x1000000
-       + string.byte(s, i+1) * 0x10000
-       + string.byte(s, i+2) * 0x100
-       + string.byte(s, i+3)
+    return string.byte(s, i) * 0x1000000
+        + string.byte(s, i + 1) * 0x10000
+        + string.byte(s, i + 2) * 0x100
+        + string.byte(s, i + 3)
 end
 
 --- Reads tile-flag metadata from a PNG file produced by `fz gfx`.
@@ -262,36 +393,36 @@ end
 -- Returns { tile_size=N, flags={[tile_id]=bitmask, ...} } or nil on failure.
 -- Tile IDs are 0-based numbers; bitmask is 0–255.
 function retrolib.load_tile_meta(path)
-  assert(_json, "retrolib.load_tile_meta requires lib/3pp/json.lua")
-  local data = love.filesystem.read(path)
-  if not data or #data < 8 then return nil end
-  if data:sub(1, 8) ~= "\137PNG\r\n\26\n" then return nil end
+    assert(_json, "retrolib.load_tile_meta requires lib/3pp/json.lua")
+    local data = love.filesystem.read(path)
+    if not data or #data < 8 then return nil end
+    if data:sub(1, 8) ~= "\137PNG\r\n\26\n" then return nil end
 
-  local pos = 9
-  while pos + 11 <= #data do
-    local len   = _u32be(data, pos)
-    local ctype = data:sub(pos + 4, pos + 7)
-    if pos + 8 + len > #data then break end
-    if ctype == "tEXt" then
-      local cdata = data:sub(pos + 8, pos + 8 + len - 1)
-      local sep   = cdata:find("\0", 1, true)
-      if sep and cdata:sub(1, sep - 1) == "fz_meta" then
-        local ok, meta = pcall(_json.decode, cdata:sub(sep + 1))
-        if ok and type(meta) == "table" then
-          local flags = {}
-          if type(meta.flags) == "table" then
-            for k, v in pairs(meta.flags) do
-              flags[tonumber(k)] = v
+    local pos = 9
+    while pos + 11 <= #data do
+        local len   = _u32be(data, pos)
+        local ctype = data:sub(pos + 4, pos + 7)
+        if pos + 8 + len > #data then break end
+        if ctype == "tEXt" then
+            local cdata = data:sub(pos + 8, pos + 8 + len - 1)
+            local sep   = cdata:find("\0", 1, true)
+            if sep and cdata:sub(1, sep - 1) == "fz_meta" then
+                local ok, meta = pcall(_json.decode, cdata:sub(sep + 1))
+                if ok and type(meta) == "table" then
+                    local flags = {}
+                    if type(meta.flags) == "table" then
+                        for k, v in pairs(meta.flags) do
+                            flags[tonumber(k)] = v
+                        end
+                    end
+                    return { tile_size = meta.tile_size or 16, flags = flags }
+                end
             end
-          end
-          return { tile_size = meta.tile_size or 16, flags = flags }
         end
-      end
+        pos = pos + 4 + 4 + len + 4
+        if ctype == "IEND" then break end
     end
-    pos = pos + 4 + 4 + len + 4
-    if ctype == "IEND" then break end
-  end
-  return nil
+    return nil
 end
 
 --- Returns true if tile tile_id has flag bit bit_index set.
@@ -299,9 +430,24 @@ end
 -- tile_id is 0-based; bit_index is 0–7 (0 = least-significant bit).
 -- Mirrors the PICO-8 fget(n, f) API.
 function retrolib.fget(meta, tile_id, bit_index)
-  if not meta or not meta.flags then return false end
-  local mask = meta.flags[tile_id] or 0
-  return math.floor(mask / (2 ^ bit_index)) % 2 == 1
+    if not meta or not meta.flags then return false end
+    local mask = meta.flags[tile_id] or 0
+    return math.floor(mask / (2 ^ bit_index)) % 2 == 1
+end
+
+-- ─── Debugging helpers ─────────────────────────────────────────────────────────
+
+function retrolib.dump(o)
+    if type(o) == 'table' then
+        local s = '{ '
+        for k, v in pairs(o) do
+            if type(k) ~= 'number' then k = '"' .. k .. '"' end
+            s = s .. '[' .. k .. '] = ' .. retrolib.dump(v) .. ','
+        end
+        return s .. '} '
+    else
+        return tostring(o)
+    end
 end
 
 -- ─── Audio ────────────────────────────────────────────────────────────────────
@@ -309,18 +455,19 @@ end
 -- Internal state
 local _sfx_sources = {}  -- cached Source objects keyed by path
 local _bgm_source  = nil -- currently playing BGM Source (or nil)
+local _bgm_path    = nil -- path of _bgm_source (Source userdata can't hold custom fields)
 
 --- Play a sound effect once.
 -- path is relative to the Love2D source directory (e.g. "assets/sfx/jump.wav").
 -- The source is cached after the first call so subsequent calls are cheap.
 function retrolib.sfx(path)
-  local src = _sfx_sources[path]
-  if not src then
-    src = love.audio.newSource(path, "static")
-    _sfx_sources[path] = src
-  end
-  src:stop()
-  src:play()
+    local src = _sfx_sources[path]
+    if not src then
+        src = love.audio.newSource(path, "static")
+        _sfx_sources[path] = src
+    end
+    src:stop()
+    src:play()
 end
 
 --- Start background music.
@@ -328,109 +475,166 @@ end
 -- loop defaults to true.  Calling bgm() again with the same path is a no-op if
 -- music is already playing; pass a different path to switch tracks (stop + start).
 function retrolib.bgm(path, loop)
-  if loop == nil then loop = true end
-  -- Already playing the same track — do nothing.
-  if _bgm_source and _bgm_source._path == path and _bgm_source:isPlaying() then
-    return
-  end
-  -- Stop previous track.
-  if _bgm_source then
-    _bgm_source:stop()
-    _bgm_source = nil
-  end
-  if not path then return end
-  local src = love.audio.newSource(path, "stream")
-  src:setLooping(loop)
-  src._path = path
-  src:play()
-  _bgm_source = src
+    if loop == nil then loop = true end
+    -- Already playing the same track — do nothing.
+    if _bgm_source and _bgm_path == path and _bgm_source:isPlaying() then
+        return
+    end
+    -- Stop previous track.
+    if _bgm_source then
+        _bgm_source:stop()
+        _bgm_source = nil
+        _bgm_path = nil
+    end
+    if not path then return end
+    local src = love.audio.newSource(path, "stream")
+    src:setLooping(loop)
+    src:play()
+    _bgm_source = src
+    _bgm_path = path
 end
 
 --- Stop background music.
 function retrolib.bgm_stop()
-  if _bgm_source then
-    _bgm_source:stop()
-    _bgm_source = nil
-  end
+    if _bgm_source then
+        _bgm_source:stop()
+        _bgm_source = nil
+        _bgm_path = nil
+    end
 end
 
 --- Pause or resume background music.
 function retrolib.bgm_pause(paused)
-  if not _bgm_source then return end
-  if paused then
-    _bgm_source:pause()
-  else
-    _bgm_source:play()
-  end
+    if not _bgm_source then return end
+    if paused then
+        _bgm_source:pause()
+    else
+        _bgm_source:play()
+    end
+end
+
+local _muted          = false
+local _premute_volume = 1
+
+--- Mutes/unmutes all audio (bgm + sfx) via the global master volume, and
+-- shows a notification of the new state. Toggling back on restores whatever
+-- volume was active right before muting.
+local function _toggle_mute()
+    _muted = not _muted
+    if _muted then
+        _premute_volume = love.audio.getVolume()
+        love.audio.setVolume(0)
+        retrolib.notify("Muted")
+    else
+        love.audio.setVolume(_premute_volume)
+        retrolib.notify("Unmuted")
+    end
+end
+
+--- Requests the app to quit.
+function retrolib.quit()
+    love.event.quit()
 end
 
 -- ─── Lifecycle / main loop ────────────────────────────────────────────────────
+function retrolib.t_now()
+    return love.timer.getTime()
+end
+
+function retrolib.notify(msg, duration, position)
+    _notify_msg   = tostring(msg)
+    _notify_until = retrolib.t_now() + (duration or 1.5)
+    _notify_area  = position or "bottom"
+end
+
+local function _draw_notification()
+    if not _notify_msg then return end
+    local now = retrolib.t_now()
+    if now > _notify_until then
+        _notify_msg = nil
+        return
+    end
+    local alpha = 1.0 - (now - (_notify_until - 1.5)) / 1.5
+    if _notify_area == "top" then
+        retrolib.draw_text_centered(_notify_msg, 8, 8, { 1, 1, 1, alpha })
+    elseif _notify_area == "bottom" then
+        retrolib.draw_rectangle(0, retrolib.SCREEN_HEIGHT - 24, retrolib.SCREEN_WIDTH, 24, { 0, 0, 0, alpha * 0.5 })
+        retrolib.draw_text(_notify_msg, 8, retrolib.SCREEN_HEIGHT - 16, 8, { 1, 1, 1, alpha })
+    else
+        retrolib.draw_text_centered(_notify_msg, retrolib.SCREEN_HEIGHT * 0.5, 8, { 1, 1, 1, alpha })
+    end
+end
 
 local function _init_graphics()
-  love.window.setTitle(retrolib.WINDOW_TITLE)
-  love.window.setMode(
-    retrolib.SCREEN_WIDTH * retrolib.SCREEN_SCALE,
-    retrolib.SCREEN_HEIGHT * retrolib.SCREEN_SCALE,
-    { resizable = false, vsync = true }
-  )
-  _canvas = love.graphics.newCanvas(retrolib.SCREEN_WIDTH, retrolib.SCREEN_HEIGHT)
-  _canvas:setFilter("nearest", "nearest")
-  love.graphics.setDefaultFilter("nearest", "nearest")
+    love.window.setTitle(retrolib.WINDOW_TITLE)
+    love.window.setMode(
+        retrolib.SCREEN_WIDTH * retrolib.SCREEN_SCALE,
+        retrolib.SCREEN_HEIGHT * retrolib.SCREEN_SCALE,
+        { resizable = false, vsync = true }
+    )
+    _canvas = love.graphics.newCanvas(retrolib.SCREEN_WIDTH, retrolib.SCREEN_HEIGHT)
+    _canvas:setFilter("nearest", "nearest")
+    love.graphics.setDefaultFilter("nearest", "nearest")
 end
 
 --- Sets up all Love2D callbacks and starts the game loop.
 -- Call this at the bottom of main.lua, passing your init/update/draw functions.
 function retrolib.main(init_func, update_func, draw_func)
-  love.load = function()
-    _init_graphics()
-    init_func()
-  end
-
-  love.update = function(dt)
-    update_func(dt)
-    -- Single-frame press state is consumed; reset for next frame.
-    _pressed_keys    = {}
-    _pressed_buttons = {}
-  end
-
-  love.draw = function()
-    -- Render the game at the virtual resolution …
-    love.graphics.setCanvas(_canvas)
-    love.graphics.clear(0, 0, 0, 1)
-    draw_func()
-    love.graphics.setCanvas()
-
-    -- Compute the largest integer scale that fits the current window,
-    -- then centre the canvas with black bars on the remaining space.
-    local ww, wh = love.graphics.getDimensions()
-    local scale  = math.floor(math.min(
-      ww / retrolib.SCREEN_WIDTH,
-      wh / retrolib.SCREEN_HEIGHT
-    ))
-    if scale < 1 then scale = 1 end
-    local ox = math.floor((ww - retrolib.SCREEN_WIDTH * scale) / 2)
-    local oy = math.floor((wh - retrolib.SCREEN_HEIGHT * scale) / 2)
-
-    love.graphics.clear(0, 0, 0, 1)
-    love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.draw(_canvas, ox, oy, 0, scale, scale)
-  end
-
-  love.keypressed = function(key)
-    _pressed_keys[key] = true
-    if key == "escape" then
-      love.event.quit()
+    love.load = function()
+        _init_graphics()
+        init_func()
     end
-    -- Ctrl+F toggles fullscreen (desktop mode keeps native resolution)
-    if key == "f" and love.keyboard.isDown("lctrl") then
-      local fs = not love.window.getFullscreen()
-      love.window.setFullscreen(fs, "desktop")
-    end
-  end
 
-  love.gamepadpressed = function(_joystick, button)
-    _pressed_buttons[button] = true
-  end
+    love.update = function(dt)
+        update_func(dt)
+        -- Single-frame press state is consumed; reset for next frame.
+        _pressed_keys    = {}
+        _pressed_buttons = {}
+    end
+
+    love.draw = function()
+        -- Render the game at the virtual resolution …
+        love.graphics.setCanvas(_canvas)
+        love.graphics.clear(0, 0, 0, 1)
+        draw_func()
+        _draw_notification()
+        love.graphics.setCanvas()
+
+        -- Compute the largest integer scale that fits the current window,
+        -- then centre the canvas with black bars on the remaining space.
+        local ww, wh = love.graphics.getDimensions()
+        local scale  = math.floor(math.min(
+            ww / retrolib.SCREEN_WIDTH,
+            wh / retrolib.SCREEN_HEIGHT
+        ))
+        if scale < 1 then scale = 1 end
+        local ox = math.floor((ww - retrolib.SCREEN_WIDTH * scale) / 2)
+        local oy = math.floor((wh - retrolib.SCREEN_HEIGHT * scale) / 2)
+
+        love.graphics.clear(0, 0, 0, 1)
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(_canvas, ox, oy, 0, scale, scale)
+    end
+
+    love.keypressed = function(key)
+        _pressed_keys[key] = true
+        if _exit_key_pressed(key) then
+            love.event.quit()
+        end
+        -- Ctrl+F toggles fullscreen (desktop mode keeps native resolution)
+        if key == "f" and love.keyboard.isDown("lctrl") then
+            local fs = not love.window.getFullscreen()
+            love.window.setFullscreen(fs, "desktop")
+        end
+        -- Ctrl+M toggles mute (zeroes/restores the master volume for all bgm+sfx)
+        if key == "m" and love.keyboard.isDown("lctrl") then
+            _toggle_mute()
+        end
+    end
+
+    love.gamepadpressed = function(_joystick, button)
+        _pressed_buttons[button] = true
+    end
 end
 
 return retrolib

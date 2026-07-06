@@ -2,7 +2,15 @@
 -- Provides Msgbox, Menubox, LinePrinter and VerticalScroller,
 -- styled with the VGA palette from retrolib.
 
-local retrolib = require("retrolib")
+local retrolib           = require("lib.retrolib")
+
+local retroui            = {}
+
+-- Optional Source objects a caller can assign (e.g. retroui.SFX_MENU_SELECT
+-- = love.audio.newSource(...)) to have Menubox play a sound on navigate/
+-- confirm. Left nil, navigation is silent.
+retroui.SFX_MENU_SELECT  = nil
+retroui.SFX_MENU_CHANGED = nil
 
 -- ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -21,20 +29,37 @@ local Msgbox = {}
 Msgbox.__index = Msgbox
 
 --- Create a centered message box.
--- @param msg  String to display.
-function Msgbox.new(msg)
-  local self     = setmetatable({}, Msgbox)
-  self.msg       = msg
-  self.font_size = 10
-  self.margin    = 4
-  self.tw        = retrolib.measure_text(msg, self.font_size)
+-- @param msg   String to display.
+-- @param opts  Table of options.  Currently supports:
+--                font_size:       Size of the text (default 10).
+--                margin:          Padding around text (default 4).
+--                auto_hide_delay: If set, the box closes itself after this
+--                                 many seconds instead of waiting for input.
+--                x, y:            Override the default centering of the box.
+function Msgbox.new(msg, opts)
+  local self           = setmetatable({}, Msgbox)
+  self.msg             = msg
+  self.font_size       = (opts and opts.font_size) or 10
+  self.margin          = (opts and opts.margin) or 4
+  self.auto_hide_delay = (opts and opts.auto_hide_delay) or nil
+  self.started_at      = nil
+  self.x               = (opts and opts.x) or nil
+  self.y               = (opts and opts.y) or nil
+  self.tw, self.th     = retrolib.measure_text_ex(msg, self.font_size)
   return self
 end
 
 --- Call every frame while the dialog is open.
 -- Returns false when the player dismisses it (BTN_A pressed), true otherwise.
 function Msgbox:update()
-  if retrolib.btnp(retrolib.BTN_A) then
+  if self.started_at == nil then
+    self.started_at = love.timer.getTime()
+  elseif self.auto_hide_delay and love.timer.getTime() - self.started_at >= self.auto_hide_delay then
+    return false
+  end
+  if self.auto_hide_delay then
+    return nil -- Don't block input if we're auto-hiding; let the caller remove us when the time comes.
+  elseif retrolib.btnp(retrolib.BTN_A) then
     return false
   end
   return true
@@ -43,9 +68,9 @@ end
 --- Draw the message box centered on the virtual screen.
 function Msgbox:draw()
   local w    = self.tw + self.margin * 2
-  local h    = self.margin * 2 + self.font_size
-  local left = math.floor((retrolib.SCREEN_WIDTH - w) / 2)
-  local top  = math.floor((retrolib.SCREEN_HEIGHT - h) / 2)
+  local h    = self.th + self.margin * 2
+  local left = self.x or math.floor((retrolib.SCREEN_WIDTH - w) / 2)
+  local top  = self.y or math.floor((retrolib.SCREEN_HEIGHT - h) / 2)
 
   retrolib.draw_rectangle(left, top, w, h, retrolib.pal_vga(1))
   retrolib.draw_rectangle_lines(left, top, w, h, retrolib.pal_vga(15))
@@ -94,13 +119,16 @@ function Menubox:update()
   end
   if retrolib.btnp(retrolib.BTN_UP) then
     self.selected = (self.selected - 2) % #self.choices + 1
+    if retroui.SFX_MENU_CHANGED then retroui.SFX_MENU_CHANGED:play() end
   end
   if retrolib.btnp(retrolib.BTN_DOWN) then
     self.selected = self.selected % #self.choices + 1
+    if retroui.SFX_MENU_CHANGED then retroui.SFX_MENU_CHANGED:play() end
   end
   if retrolib.btnp(retrolib.BTN_A) then
     local action = self.choices[self.selected][2]
     if action then action() end
+    if retroui.SFX_MENU_SELECT then retroui.SFX_MENU_SELECT:play() end
     return false
   end
   return true
@@ -165,6 +193,8 @@ function LinePrinter:update(dt)
     -- A skips straight to the end
     if retrolib.btnp(retrolib.BTN_A) then
       self.shown_chars = self.total_chars
+    elseif retrolib.btn(retrolib.BTN_B) then
+      self.timer = self.timer + dt * 3 -- B speeds up the text
     end
   else
     if retrolib.btnp(retrolib.BTN_A) then
@@ -207,6 +237,9 @@ VerticalScroller.__index = VerticalScroller
 --                 bg:          Background color (default: BLACK).
 --                 speed:       Scroll speed in pixels/second (default 24).
 --                 line_height: Vertical spacing per line in pixels (default 12).
+--                 font:        TTF path to render with, or false to force
+--                              LÖVE2D's own built-in system font. Omitted
+--                              (nil) leaves retrolib.FONT_PATH untouched.
 function VerticalScroller.new(text, opts)
   opts              = opts or {}
   local self        = setmetatable({}, VerticalScroller)
@@ -216,7 +249,9 @@ function VerticalScroller.new(text, opts)
   self.speed        = opts.speed or 24
   self.line_height  = opts.line_height or 12
   self.font_size    = opts.font_size or 10
-  self.scroll_y     = retrolib.SCREEN_HEIGHT  -- start below the screen
+  self.has_font     = opts.font ~= nil -- an explicit choice was made
+  self.font         = opts.font or nil -- false collapses to nil (LÖVE's default font)
+  self.scroll_y     = retrolib.SCREEN_HEIGHT -- start below the screen
   self.total_height = #self.lines * self.line_height
   return self
 end
@@ -225,10 +260,15 @@ end
 -- @param dt  Delta time in seconds.
 -- Returns false when the text has scrolled fully off screen, or when skipped.
 function VerticalScroller:update(dt)
-  if retrolib.btnp(retrolib.BTN_A) or retrolib.btnp(retrolib.BTN_B) then
+  if retrolib.btnp(retrolib.BTN_A) or retrolib.btnp(retrolib.BTN_START) then
     return false
   end
-  self.scroll_y = self.scroll_y - self.speed * dt
+  local fac = 1
+  if retrolib.btn(retrolib.BTN_B) then
+    fac = 6 -- speed up if B is held
+  end
+
+  self.scroll_y = self.scroll_y - (self.speed * dt * fac)
   if self.scroll_y + self.total_height < 0 then
     return false
   end
@@ -239,7 +279,17 @@ end
 function VerticalScroller:draw()
   local sw = retrolib.SCREEN_WIDTH
   local sh = retrolib.SCREEN_HEIGHT
+
   retrolib.draw_rectangle(0, 0, sw, sh, self.bg)
+
+  -- Swap in this scroller's font for the duration of the text draw, if one
+  -- was given (a path, or false for LÖVE's built-in font); otherwise
+  -- retrolib's own current default font is left untouched.
+  local prev_font_path = retrolib.FONT_PATH
+  if self.has_font then
+    retrolib.FONT_PATH = self.font
+  end
+
   for i, line in ipairs(self.lines) do
     local y = self.scroll_y + (i - 1) * self.line_height
     if y + self.font_size >= 0 and y < sh then
@@ -247,12 +297,16 @@ function VerticalScroller:draw()
       retrolib.draw_text(line, math.floor((sw - tw) / 2), y, self.font_size, self.fg)
     end
   end
+
+  if self.has_font then
+    retrolib.FONT_PATH = prev_font_path
+  end
 end
 
 -- ─── Module exports ───────────────────────────────────────────────────────────
-return {
-  Msgbox           = Msgbox,
-  Menubox          = Menubox,
-  LinePrinter      = LinePrinter,
-  VerticalScroller = VerticalScroller,
-}
+retroui.Msgbox           = Msgbox
+retroui.Menubox          = Menubox
+retroui.LinePrinter      = LinePrinter
+retroui.VerticalScroller = VerticalScroller
+
+return retroui
