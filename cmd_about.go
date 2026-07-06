@@ -91,5 +91,14 @@ https://github.com/Ulysse66/push
 tick.lua  —  fixed-timestep game loop
 MIT License
 Copyright (c) bjornbytes
-https://github.com/bjornbytes/tick`)
+https://github.com/bjornbytes/tick
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bundled tools
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BeepBox (offline build)  —  browser-based chiptune music editor
+MIT License
+Copyright (c) John Nesky and contributing authors
+https://github.com/johnnesky/beepbox`)
 }

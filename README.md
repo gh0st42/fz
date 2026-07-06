@@ -142,6 +142,19 @@ Kept  main.lua
 
 Project info (title, author) is read silently from the existing `conf.lua` and `main.lua` so you are not re-prompted unless those files are missing.
 
+### `fz bgm new <name>` / `fz bgm edit <name>`
+
+Manages BeepBox song files stored in the `bgm/` directory of your project.
+
+```
+fz bgm new theme        # creates bgm/theme.html and opens it in the browser
+fz bgm edit theme       # opens bgm/theme.html in the browser
+```
+
+`fz bgm new` copies the bundled offline BeepBox editor to `bgm/<name>.html` and opens it in your default browser. Edit your song in BeepBox and use its export/share features to save state — BeepBox encodes the full song in the URL hash, so saving the page (Ctrl+S) or bookmarking the URL preserves your work. When you are happy with the result, use BeepBox's **Export** button to produce a `.wav` or `.mid` and place it in `assets/sfx/` or `assets/bgm/`.
+
+`fz bgm edit` opens an already-created song file. The `.html` extension is optional for both subcommands.
+
 ### `fz gfx [file]`
 
 Opens a pixel-art sprite-sheet editor. `file` is resolved under `assets/gfx/`; omit it to start with a blank 256×256 sheet.
