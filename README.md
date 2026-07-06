@@ -73,6 +73,34 @@ Builds a `.love` archive into `dist/`. Common noise (`node_modules/`, `.git/`, `
 | `--web` | Also builds a web export into `dist/www/` using love.js (requires Node.js / npx) |
 | `--compat` | Passes `-c` to love.js, building without `SharedArrayBuffer`. Use only when deploying to hosts that block cross-origin isolation headers (e.g. older itch.io embeds) |
 
+**`.distignore`**
+
+Place a `.distignore` file in the project root to control which files and directories are included in the `.love` archive. The syntax is the same as `.gitignore`:
+
+- Blank lines and lines starting with `#` are ignored.
+- `*` matches any sequence of characters except `/`; `?` matches a single such character.
+- `**` matches across directory boundaries (`assets/**/tmp` matches `assets/a/b/tmp`).
+- A pattern without a `/` matches against the file or directory name at any depth (`*.psd` excludes all PSD files everywhere).
+- A leading `/` anchors the pattern to the project root (`/secrets.lua` excludes only the top-level file).
+- A trailing `/` matches directories only (`scratch/` excludes the whole directory tree).
+- A leading `!` negates a previous rule and re-includes the matching path.
+- Rules are evaluated in order; the last matching rule wins.
+
+```
+# exclude design sources and scratch work
+*.psd
+*.aseprite
+scratch/
+
+# exclude a specific top-level file
+/TODO.txt
+
+# keep one specific file that would otherwise be excluded
+!assets/fonts/keep.txt
+```
+
+The hardcoded exclusions (`dist/`, `.git/`, `node_modules/`, hidden files, editor swap files) are always applied before `.distignore` rules and cannot be overridden.
+
 ### `fz serve [--port N]`
 
 Starts a local HTTP server on `dist/www/` (default port 8000). Sets the two headers browsers require before exposing `SharedArrayBuffer`:

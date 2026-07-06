@@ -19,6 +19,11 @@ func createLoveArchive(rootDir, archivePath string) error {
 	zipWriter := zip.NewWriter(archiveFile)
 	defer zipWriter.Close()
 
+	patterns, err := loadDistignore(rootDir)
+	if err != nil {
+		return err
+	}
+
 	return filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -45,6 +50,9 @@ func createLoveArchive(rootDir, archivePath string) error {
 			if strings.HasPrefix(base, ".") {
 				return filepath.SkipDir
 			}
+			if distignoreMatch(patterns, filepath.ToSlash(relPath), true) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -63,6 +71,9 @@ func createLoveArchive(rootDir, archivePath string) error {
 		}
 		// Don't bundle .love files that happen to live in the project root.
 		if filepath.Dir(relPath) == "." && strings.HasSuffix(strings.ToLower(base), ".love") {
+			return nil
+		}
+		if distignoreMatch(patterns, filepath.ToSlash(relPath), false) {
 			return nil
 		}
 
