@@ -21,7 +21,7 @@ retrolib.BTN_UP            = { keyboard = { "up" }, gamepad = { "dpup" }, dx = 0
 retrolib.BTN_DOWN          = { keyboard = { "down" }, gamepad = { "dpdown" }, dx = 0, dy = 1 }
 retrolib.BTN_LEFT          = { keyboard = { "left" }, gamepad = { "dpleft" }, dx = -1, dy = 0 }
 retrolib.BTN_RIGHT         = { keyboard = { "right" }, gamepad = { "dpright" }, dx = 1, dy = 0 }
-retrolib.BTN_A             = { keyboard = { "return", "x" }, gamepad = { "a" }, dx = 0, dy = 0 }
+retrolib.BTN_A             = { keyboard = { "x" }, gamepad = { "a" }, dx = 0, dy = 0 }
 retrolib.BTN_B             = { keyboard = { "rshift", "y", "z" }, gamepad = { "b" }, dx = 0, dy = 0 }
 retrolib.BTN_X             = { keyboard = { "space", "s" }, gamepad = { "x" }, dx = 0, dy = 0 }
 retrolib.BTN_Y             = { keyboard = { "tab", "a" }, gamepad = { "y" }, dx = 0, dy = 0 }
@@ -188,10 +188,18 @@ function retrolib.measure_text_ex(text, size)
     local line_h = font:getHeight()
     local max_w = 0
     local count = 0
-    for line in ((text or "") .. "\n"):gmatch("(.-)\n") do
-        local w = font:getWidth(line)
-        if w > max_w then max_w = w end
-        count = count + 1
+    if type(text) == "string" then
+        for line in ((text or "") .. "\n"):gmatch("(.-)\n") do
+            local w = font:getWidth(line)
+            if w > max_w then max_w = w end
+            count = count + 1
+        end
+    else
+        for _, line in ipairs(text) do
+            local w = font:getWidth(line)
+            if w > max_w then max_w = w end
+            count = count + 1
+        end
     end
     return max_w, line_h * math.max(count, 1)
 end
@@ -274,6 +282,38 @@ function retrolib.draw_sprite(texture, sprite_id, x, y, square_sprite_size)
         iw, ih)
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.draw(texture, quad, x, y)
+end
+
+local _inv_circle_mask, _inv_circle_key = nil, nil
+
+--- Draws `color` over everything on screen except the inside of a circle of
+-- `radius` centered at (x, y), which is left untouched. Uses only classic
+-- drawing primitives (rectangle fill + circle cutout via blend mode), no
+-- shaders or stencil buffer. Inherits whatever camera transform (if any) is
+-- currently active, same as draw_texture/draw_sprite.
+function retrolib.draw_inverted_circle(x, y, radius, color)
+    local key = string.format("%g|%g,%g,%g,%g", radius, color[1], color[2], color[3], color[4] or 1)
+    local mask = _inv_circle_mask
+    if key ~= _inv_circle_key or not mask then
+        local w, h = retrolib.SCREEN_WIDTH * 2, retrolib.SCREEN_HEIGHT * 2
+        local prev_canvas = love.graphics.getCanvas()
+        mask = love.graphics.newCanvas(w, h)
+        love.graphics.setCanvas(mask)
+        love.graphics.push()
+        love.graphics.origin()
+        love.graphics.clear(0, 0, 0, 0)
+        love.graphics.setColor(color)
+        love.graphics.rectangle("fill", 0, 0, w, h)
+        love.graphics.setBlendMode("replace")
+        love.graphics.setColor(0, 0, 0, 0)
+        love.graphics.circle("fill", w / 2, h / 2, radius)
+        love.graphics.setBlendMode("alpha")
+        love.graphics.pop()
+        love.graphics.setCanvas(prev_canvas)
+        _inv_circle_mask, _inv_circle_key = mask, key
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(mask, x - mask:getWidth() / 2, y - mask:getHeight() / 2)
 end
 
 -- ─── Camera (mirrors raylib Camera2D semantics) ───────────────────────────────
@@ -543,7 +583,7 @@ end
 
 function retrolib.notify(msg, duration, position)
     _notify_msg   = tostring(msg)
-    _notify_until = retrolib.t_now() + (duration or 1.5)
+    _notify_until = retrolib.t_now() + (duration or 3)
     _notify_area  = position or "bottom"
 end
 
@@ -563,6 +603,11 @@ local function _draw_notification()
     else
         retrolib.draw_text_centered(_notify_msg, retrolib.SCREEN_HEIGHT * 0.5, 8, { 1, 1, 1, alpha })
     end
+end
+
+function retrolib.toggle_fullscreen()
+    local fs = not love.window.getFullscreen()
+    love.window.setFullscreen(fs, "desktop")
 end
 
 local function _init_graphics()
@@ -623,8 +668,7 @@ function retrolib.main(init_func, update_func, draw_func)
         end
         -- Ctrl+F toggles fullscreen (desktop mode keeps native resolution)
         if key == "f" and love.keyboard.isDown("lctrl") then
-            local fs = not love.window.getFullscreen()
-            love.window.setFullscreen(fs, "desktop")
+            retrolib.toggle_fullscreen()
         end
         -- Ctrl+M toggles mute (zeroes/restores the master volume for all bgm+sfx)
         if key == "m" and love.keyboard.isDown("lctrl") then

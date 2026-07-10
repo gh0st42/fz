@@ -3,8 +3,8 @@
 -- Encoding: plain list, base64, base64+gzip, base64+zlib.
 -- Uses rxi/json.lua for JSON parsing.
 
-local json     = require("json")
-local retrolib = require("retrolib")
+local json     = require("lib.3pp.json")
+local retrolib = require("lib.retrolib")
 
 -- ─── Path utilities ───────────────────────────────────────────────────────────
 

@@ -228,6 +228,11 @@ type mapState struct {
 	saveActive   bool
 	saveFilename string
 
+	// Export PNG dialog
+	exportActive      bool
+	exportFilename    string
+	pendingExportPath string // set by commitMapExport, consumed in main loop
+
 	// Viewport hover
 	hoverX, hoverY int
 	hoverValid     bool
@@ -1455,6 +1460,16 @@ func runMap(args []string) error {
 			state.pendingSheetName = ""
 		}
 
+		if state.pendingExportPath != "" {
+			path := state.pendingExportPath
+			state.pendingExportPath = ""
+			if err := exportMapFlat(state, path); err != nil {
+				state.toast.Notify("Export failed: " + err.Error())
+			} else {
+				state.toast.Notify("Exported " + filepath.Base(path))
+			}
+		}
+
 		if state.showMinimap && state.minimapDirty {
 			renderMinimap(state)
 		}
@@ -1507,6 +1522,7 @@ func drawMapScene(s *mapState) {
 	drawMapStatusBar(s)
 	drawMapResizeDialog(s)
 	drawMapSaveDialog(s)
+	drawMapExportDialog(s)
 	if !s.focusMode {
 		drawMapFileDropdown(s)    // last — z-order above everything
 		drawMapTilesetDropdown(s) // last — z-order above everything
@@ -1625,7 +1641,7 @@ func drawMapToolbar(s *mapState) {
 	rl.DrawRectangle(0, 0, virtualW, toolbarH, rl.NewColor(30, 30, 30, 255))
 	rl.DrawLine(0, toolbarH, virtualW, toolbarH, rl.NewColor(60, 60, 60, 255))
 
-	blocked := s.resize.active || s.saveActive || s.sheetDropEdit || s.mapDropEdit
+	blocked := s.resize.active || s.saveActive || s.exportActive || s.sheetDropEdit || s.mapDropEdit
 	if blocked {
 		raygui.SetState(raygui.STATE_DISABLED)
 	}
@@ -1654,6 +1670,14 @@ func drawMapToolbar(s *mapState) {
 		s.tmjBase = nil
 		s.minimapDirty = true
 		rl.SetWindowTitle("fz map")
+	}
+	if raygui.Button(rl.NewRectangle(314, 4, 56, 20), "Export") && !blocked {
+		s.exportActive = true
+		if s.mapPath != "" {
+			s.exportFilename = strings.TrimSuffix(filepath.Base(s.mapPath), ".tmj")
+		} else {
+			s.exportFilename = ""
+		}
 	}
 	if raygui.Button(rl.NewRectangle(256, 4, 50, 20), "Resize") && !blocked {
 		s.resize.active = true
@@ -2537,7 +2561,7 @@ func drawMapTilePanel(s *mapState) {
 }
 
 func drawMapTilesetDropdown(s *mapState) {
-	if s.resize.active || s.saveActive || s.mapDropEdit {
+	if s.resize.active || s.saveActive || s.exportActive || s.mapDropEdit {
 		return
 	}
 	// Only visible in tile-layer mode
@@ -2566,7 +2590,7 @@ func drawMapTilesetDropdown(s *mapState) {
 }
 
 func drawMapFileDropdown(s *mapState) {
-	if s.resize.active || s.saveActive || s.sheetDropEdit {
+	if s.resize.active || s.saveActive || s.exportActive || s.sheetDropEdit {
 		return
 	}
 	prev := s.prevMapDropEdit
@@ -2811,6 +2835,117 @@ func commitMapSave(s *mapState) {
 	}
 }
 
+// ── export PNG dialog ─────────────────────────────────────────────────────────
+
+func drawMapExportDialog(s *mapState) {
+	if !s.exportActive {
+		return
+	}
+	rl.DrawRectangle(0, 0, virtualW, virtualH, rl.NewColor(0, 0, 0, 160))
+	const dw, dh = int32(280), int32(100)
+	dx := (virtualW - dw) / 2
+	dy := (virtualH - dh) / 2
+
+	rl.DrawRectangle(dx, dy, dw, dh, rl.NewColor(38, 38, 50, 255))
+	rl.DrawRectangleLines(dx, dy, dw, dh, rl.NewColor(80, 100, 150, 255))
+	rl.DrawText("Export PNG", dx+8, dy+8, 11, rl.NewColor(200, 200, 210, 255))
+	rl.DrawLine(dx, dy+22, dx+dw, dy+22, rl.NewColor(60, 60, 80, 255))
+
+	rl.DrawRectangle(dx+8, dy+30, dw-16, 18, rl.NewColor(20, 20, 28, 255))
+	rl.DrawRectangleLines(dx+8, dy+30, dw-16, 18, rl.NewColor(100, 140, 220, 255))
+	rl.DrawText(s.exportFilename+"_", dx+12, dy+34, 10, rl.White)
+
+	hint := "assets/maps/" + s.exportFilename + ".png"
+	rl.DrawText(hint, dx+8, dy+54, 9, rl.NewColor(100, 100, 120, 255))
+
+	bw := int32(60)
+	if raygui.Button(rl.NewRectangle(float32(dx+dw-bw*2-14), float32(dy+dh-28), float32(bw), 20), "Export") {
+		commitMapExport(s)
+	}
+	if raygui.Button(rl.NewRectangle(float32(dx+dw-bw-6), float32(dy+dh-28), float32(bw), 20), "Cancel") {
+		s.exportActive = false
+	}
+}
+
+func commitMapExport(s *mapState) {
+	name := strings.TrimSpace(s.exportFilename)
+	if name == "" {
+		return
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".png") {
+		name += ".png"
+	}
+	s.pendingExportPath = filepath.Join("assets", "maps", name)
+	s.exportActive = false
+}
+
+// exportMapFlat renders all currently visible tile layers into a flat PNG at
+// 1:1 tile scale (no zoom). Must be called outside BeginTextureMode(canvas).
+func exportMapFlat(s *mapState, path string) error {
+	if s.sheetTex.ID == 0 || s.tileSize <= 0 || s.mapW <= 0 || s.mapH <= 0 {
+		return fmt.Errorf("nothing to export")
+	}
+	columns := s.sheetColumns
+	if columns <= 0 && s.tileSize > 0 {
+		columns = s.sheetSz / s.tileSize
+	}
+	if columns <= 0 {
+		return fmt.Errorf("no tileset loaded")
+	}
+	firstGID := s.tilesetFirstGID
+	if firstGID <= 0 {
+		firstGID = 1
+	}
+
+	imgW := int32(s.mapW * s.tileSize)
+	imgH := int32(s.mapH * s.tileSize)
+
+	rt := rl.LoadRenderTexture(imgW, imgH)
+	defer rl.UnloadRenderTexture(rt)
+
+	rl.BeginTextureMode(rt)
+	rl.ClearBackground(rl.NewColor(0, 0, 0, 0))
+	// Draw bottom-up (highest index first) to match viewport layer order.
+	for li := len(s.layers) - 1; li >= 0; li-- {
+		layer := s.layers[li]
+		if !layer.visible || layer.kind != layerKindTile || len(layer.data) == 0 {
+			continue
+		}
+		for row := 0; row < s.mapH; row++ {
+			for col := 0; col < s.mapW; col++ {
+				gid := layer.data[row*s.mapW+col]
+				rawID := gid &^ gidFlagMask
+				if rawID < uint32(firstGID) {
+					continue
+				}
+				ti := int(rawID) - firstGID
+				p := gidToRenderParams(gid & gidFlagMask)
+				dst := rl.NewRectangle(
+					float32(col*s.tileSize),
+					float32(row*s.tileSize),
+					float32(s.tileSize),
+					float32(s.tileSize),
+				)
+				drawTileTransformed(s.sheetTex, ti, columns, s.tileSize, dst, p.flipH, p.flipV, p.rotation, rl.White)
+			}
+		}
+	}
+	rl.EndTextureMode()
+
+	// RenderTexture Y axis is flipped relative to image conventions.
+	img := rl.LoadImageFromTexture(rt.Texture)
+	defer rl.UnloadImage(img)
+	rl.ImageFlipVertical(img)
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if !rl.ExportImage(*img, path) {
+		return fmt.Errorf("failed to write %s", path)
+	}
+	return nil
+}
+
 // ── status bar ────────────────────────────────────────────────────────────────
 
 func drawMapStatusBar(s *mapState) {
@@ -2958,6 +3093,10 @@ func handleMapInput(s *mapState, dt float64) {
 	}
 	if s.saveActive {
 		handleMapSaveInput(s)
+		return
+	}
+	if s.exportActive {
+		handleMapExportInput(s)
 		return
 	}
 	if s.renaming {
@@ -3357,6 +3496,26 @@ func handleMapResizeInput(s *mapState) {
 	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
 		if c >= '0' && c <= '9' && len(*target) < 6 {
 			*target += string(c)
+		}
+	}
+}
+
+func handleMapExportInput(s *mapState) {
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		s.exportActive = false
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyEnter) {
+		commitMapExport(s)
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyBackspace) && len(s.exportFilename) > 0 {
+		r := []rune(s.exportFilename)
+		s.exportFilename = string(r[:len(r)-1])
+	}
+	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+		if len(s.exportFilename) < 48 {
+			s.exportFilename += string(c)
 		}
 	}
 }

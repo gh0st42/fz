@@ -59,7 +59,7 @@ function Msgbox:update()
   end
   if self.auto_hide_delay then
     return nil -- Don't block input if we're auto-hiding; let the caller remove us when the time comes.
-  elseif retrolib.btnp(retrolib.BTN_A) then
+  elseif retrolib.btnp(retrolib.BTN_A) or retrolib.btnp(retrolib.BTN_START) then
     return false
   end
   return true
@@ -99,11 +99,16 @@ function Menubox.new(choices, opts)
   self.abortable = (opts and opts.abortable ~= false)
   self.x         = (opts and opts.x) or nil
   self.y         = (opts and opts.y) or nil
+  self.headline  = (opts and opts.headline) or nil
 
   -- Measure the widest label.
   local max_w    = 0
   for _, c in ipairs(choices) do
     local w = retrolib.measure_text(c[1], self.font_size)
+    if w > max_w then max_w = w end
+  end
+  if self.headline then
+    local w = retrolib.measure_text(self.headline, self.font_size)
     if w > max_w then max_w = w end
   end
   self.tw = max_w
@@ -125,7 +130,7 @@ function Menubox:update()
     self.selected = self.selected % #self.choices + 1
     if retroui.SFX_MENU_CHANGED then retroui.SFX_MENU_CHANGED:play() end
   end
-  if retrolib.btnp(retrolib.BTN_A) then
+  if retrolib.btnp(retrolib.BTN_A) or retrolib.btnp(retrolib.BTN_START) then
     local action = self.choices[self.selected][2]
     if action then action() end
     if retroui.SFX_MENU_SELECT then retroui.SFX_MENU_SELECT:play() end
@@ -139,15 +144,26 @@ function Menubox:draw()
   local row_h = self.font_size + self.margin
   local w     = self.tw + self.margin * 2
   local h     = self.margin * 2 + #self.choices * row_h
-  local left  = self.x or math.floor((retrolib.SCREEN_WIDTH - w) / 2)
-  local top   = self.y or math.floor((retrolib.SCREEN_HEIGHT - h) / 2)
+  if self.headline then
+    h = h + row_h
+  end
+  local left = self.x or math.floor((retrolib.SCREEN_WIDTH - w) / 2)
+  local top  = self.y or math.floor((retrolib.SCREEN_HEIGHT - h) / 2)
 
   retrolib.draw_rectangle(left, top, w, h, retrolib.pal_vga(1))
   retrolib.draw_rectangle_lines(left, top, w, h, retrolib.pal_vga(15))
 
+  if self.headline then
+    retrolib.draw_text(self.headline, left + self.margin, top + self.margin,
+      self.font_size, retrolib.WHITE)
+  end
+
   for i, choice in ipairs(self.choices) do
     local color = (i == self.selected) and retrolib.WHITE or retrolib.pal_vga(7)
     local y     = top + self.margin + (i - 1) * row_h
+    if self.headline then
+      y = y + row_h
+    end
     retrolib.draw_text(choice[1], left + self.margin, y, self.font_size, color)
   end
 end
@@ -159,25 +175,32 @@ end
 local LinePrinter = {}
 LinePrinter.__index = LinePrinter
 
---- Create a typewriter-effect text box pinned to the bottom of the screen.
--- @param text   String to display (may contain newlines).
+--- Print lines top to bottom, either with a delay line by line or instantaneously.
+-- @param text   String to display (may contain newlines) or a table of lines.
 -- @param opts   Table of options:
 --                 fg:    Text color (default: WHITE).
---                 bg:    Background color (default: BLACK).
---                 delay: Seconds per character; 0 = instant (default 0).
+--                 bg:    Background color (default: BLACK) or -1 for transparent.
+--                 delay: Seconds per line; 0 = instant (default 0).
 function LinePrinter.new(text, opts)
-  opts             = opts or {}
-  local self       = setmetatable({}, LinePrinter)
-  self.lines       = split_lines(text)
-  self.full_text   = text or ""
-  self.total_chars = #self.full_text
-  self.fg          = opts.fg or retrolib.WHITE
-  self.bg          = opts.bg or retrolib.BLACK
-  self.delay       = opts.delay or 0
-  self.font_size   = opts.font_size or 10
-  self.margin      = opts.margin or 6
-  self.shown_chars = (self.delay <= 0) and self.total_chars or 0
-  self.timer       = 0
+  opts       = opts or {}
+  local self = setmetatable({}, LinePrinter)
+  if type(text) == "table" then
+    self.lines = text
+  else
+    self.lines = split_lines(text)
+  end
+  self.fg                = opts.fg or retrolib.WHITE
+  self.bg                = opts.bg or retrolib.BLACK
+  self.delay             = opts.delay or 0
+  self.font_size         = opts.font_size or 10
+  -- measure_text_ex("", size) with a single (empty) line reliably returns
+  -- just that one line's height, regardless of how many lines self.lines has.
+  local _, line_h        = retrolib.measure_text_ex("", self.font_size)
+  self.line_height       = line_h * 1.2 -- a little breathing room between rows
+  self.total_text_height = #self.lines * self.line_height
+  self.row_index         = (self.delay <= 0) and #self.lines or 1
+  self.done              = self.delay <= 0
+  self.timer             = 0
   return self
 end
 
@@ -185,16 +208,19 @@ end
 -- @param dt  Delta time in seconds.
 -- Returns false when the player dismisses the box.
 function LinePrinter:update(dt)
-  if self.shown_chars < self.total_chars then
+  if not self.done then
     if self.delay > 0 then
-      self.timer       = self.timer + dt
-      self.shown_chars = math.min(self.total_chars, math.floor(self.timer / self.delay))
+      self.timer     = self.timer + dt
+      self.row_index = math.min(#self.lines, math.floor(self.timer / self.delay) + 1)
     end
     -- A skips straight to the end
     if retrolib.btnp(retrolib.BTN_A) then
-      self.shown_chars = self.total_chars
+      self.row_index = #self.lines
     elseif retrolib.btn(retrolib.BTN_B) then
       self.timer = self.timer + dt * 3 -- B speeds up the text
+    end
+    if self.row_index >= #self.lines then
+      self.done = true
     end
   else
     if retrolib.btnp(retrolib.BTN_A) then
@@ -204,24 +230,25 @@ function LinePrinter:update(dt)
   return true
 end
 
---- Draw the typewriter box at the bottom of the virtual screen.
+--- Draw the lines top to bottom on the virtual screen.
 function LinePrinter:draw()
   local sw    = retrolib.SCREEN_WIDTH
   local sh    = retrolib.SCREEN_HEIGHT
-  local row_h = self.font_size + 2
-  local box_h = self.margin * 2 + #self.lines * row_h
-  local box_y = sh - box_h - 4
+  local row_h = self.line_height
+  local box_h = self.total_text_height
+  local box_y = (sh - box_h) / 2 -- center vertically
 
-  retrolib.draw_rectangle(4, box_y, sw - 8, box_h, self.bg)
-  retrolib.draw_rectangle_lines(4, box_y, sw - 8, box_h, retrolib.WHITE)
+  if self.bg ~= -1 then
+    retrolib.clear_background(self.bg)
+  end
 
-  local chars_left = self.shown_chars
-  for i, line in ipairs(self.lines) do
-    if chars_left <= 0 then break end
-    retrolib.draw_text(line:sub(1, chars_left),
-      4 + self.margin, box_y + self.margin + (i - 1) * row_h,
+  -- retrolib.draw_rectangle(4, box_y, sw - 8, box_h, self.bg)
+  -- retrolib.draw_rectangle_lines(4, box_y, sw - 8, box_h, retrolib.WHITE)
+
+  for i = 1, self.row_index do
+    local line = self.lines[i]
+    retrolib.draw_text_centered(line, box_y + (i - 1) * row_h,
       self.font_size, self.fg)
-    chars_left = chars_left - #line - 1 -- -1 for the implicit newline separator
   end
 end
 
@@ -249,8 +276,8 @@ function VerticalScroller.new(text, opts)
   self.speed        = opts.speed or 24
   self.line_height  = opts.line_height or 12
   self.font_size    = opts.font_size or 10
-  self.has_font     = opts.font ~= nil -- an explicit choice was made
-  self.font         = opts.font or nil -- false collapses to nil (LÖVE's default font)
+  self.has_font     = opts.font ~= nil       -- an explicit choice was made
+  self.font         = opts.font or nil       -- false collapses to nil (LÖVE's default font)
   self.scroll_y     = retrolib.SCREEN_HEIGHT -- start below the screen
   self.total_height = #self.lines * self.line_height
   return self
@@ -303,10 +330,108 @@ function VerticalScroller:draw()
   end
 end
 
+-- ─── PrompterBox ─────────────────────────────────────────────────────────
+
+local PrompterBox = {}
+PrompterBox.__index = PrompterBox
+
+-- Show multiple lines of text in a box, with a teleprompter typing effect.  The caller
+-- is responsible for calling :update() and :draw() each frame.
+function PrompterBox.new(text, opts)
+  opts                = opts or {}
+  local self          = setmetatable({}, PrompterBox)
+  self.text           = text
+  self.font_size      = opts.font_size or 10
+  self.margin         = opts.margin or 4
+  self.x              = 8
+  self.y              = retrolib.SCREEN_HEIGHT - (retrolib.SCREEN_HEIGHT / 3 + 8)
+  self.w              = retrolib.SCREEN_WIDTH - 16
+  self.h              = retrolib.SCREEN_HEIGHT / 3
+  self.speaker        = (opts and opts.speaker) or nil
+  self.tw, self.th    = retrolib.measure_text_ex(text, self.font_size)
+  self.awaiting_input = false
+  self.char_index     = 1
+  self.char_timer     = 0
+  self.char_delay     = opts.char_delay or 0.05 -- seconds per character
+  self.row_index      = 1
+  return self
+end
+
+function PrompterBox:update(dt)
+  -- Update the teleprompter effect here.
+  -- This is a stub implementation; actual implementation would
+  -- advance the text based on dt and possibly user input.
+
+  if self.awaiting_input then
+    if retrolib.btnp(retrolib.BTN_A) or retrolib.btnp(retrolib.BTN_START) then
+      self.awaiting_input = false
+      return false -- Return false to indicate the box should close.
+    end
+  else
+    self.char_timer = self.char_timer + dt
+    if retrolib.btn(retrolib.BTN_B) then
+      self.char_timer = self.char_timer + dt * 3 -- B speeds up the text
+    end
+    if retrolib.btnp(retrolib.BTN_A) then
+      -- Skip to the end of the current line or all text.
+      if self.row_index < #self.text then
+        self.row_index = #self.text
+        self.char_index = #self.text[self.row_index]
+      else
+        self.awaiting_input = true
+      end
+    end
+    if self.char_timer >= self.char_delay then
+      self.char_timer = self.char_timer - self.char_delay
+      self.char_index = self.char_index + 1
+      if self.char_index > #self.text[self.row_index] then
+        self.row_index = self.row_index + 1
+        self.char_index = 1
+        if self.row_index > #self.text then
+          self.awaiting_input = true
+        end
+      end
+    end
+  end
+
+  return true -- Return true to indicate the box is still active.
+end
+
+function PrompterBox:draw()
+  retrolib.draw_rectangle(self.x, self.y, self.w, self.h, retrolib.pal_vga(1))
+  retrolib.draw_rectangle_lines(self.x, self.y, self.w, self.h, retrolib.pal_vga(15))
+  if self.speaker then
+    local speaker_text = self.speaker .. ":"
+    retrolib.draw_text(speaker_text, self.x + self.margin, self.y + self.margin,
+      self.font_size, retrolib.WHITE)
+  end
+  local text_y = self.y + self.margin
+  if self.speaker then
+    text_y = text_y + self.font_size + self.margin
+  end
+  for i = 1, self.row_index do
+    local line = self.text[i]
+    if not line then break end
+    local display_line = line
+    if i == self.row_index then
+      display_line = line:sub(1, self.char_index)
+    end
+    retrolib.draw_text(display_line, self.x + self.margin, text_y,
+      self.font_size, retrolib.WHITE)
+    text_y = text_y + self.font_size + self.margin
+  end
+  if self.awaiting_input and love.timer.getTime() % 1 < 0.5 then
+    local prompt = "..."
+    local prompt_w = retrolib.measure_text(prompt, self.font_size)
+    retrolib.draw_text(prompt, self.x + self.w - prompt_w - self.margin,
+      self.y + self.h - self.font_size - self.margin, self.font_size, retrolib.WHITE)
+  end
+end
+
 -- ─── Module exports ───────────────────────────────────────────────────────────
 retroui.Msgbox           = Msgbox
 retroui.Menubox          = Menubox
 retroui.LinePrinter      = LinePrinter
 retroui.VerticalScroller = VerticalScroller
-
+retroui.PrompterBox      = PrompterBox
 return retroui
