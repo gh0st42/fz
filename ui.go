@@ -1,9 +1,43 @@
 package main
 
 import (
+	"runtime"
+
 	"github.com/gen2brain/raylib-go/raygui"
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
+
+// fixRetinaStartupScale works around a raylib/GLFW-Cocoa bug (raysan5/raylib#5059)
+// where a window created directly on a Retina display — i.e. launched with no
+// external monitor ever attached — gets the wrong backing-store scale baked
+// into GetRenderWidth/Height at InitWindow time. Everything derived from that
+// (mouse-to-canvas mapping, the canvas blit rect) ends up offset by roughly
+// the title-bar height until some later event forces Cocoa to recompute it:
+// moving the window to another display, or toggling fullscreen. This replays
+// that fullscreen round-trip once at startup, before the window is shown to
+// the user, so they don't have to do it by hand. Non-Retina Mac displays and
+// external monitors report a 1:1 DPI scale and are left untouched; other
+// platforms don't exhibit this bug at all.
+func fixRetinaStartupScale() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	if s := rl.GetWindowScaleDPI(); s.X <= 1 && s.Y <= 1 {
+		return
+	}
+	rl.ToggleFullscreen()
+	settleWindowFrames()
+	rl.ToggleFullscreen()
+	settleWindowFrames()
+}
+
+func settleWindowFrames() {
+	for i := 0; i < 10; i++ {
+		rl.BeginDrawing()
+		rl.ClearBackground(rl.Black)
+		rl.EndDrawing()
+	}
+}
 
 // Toast is a transient notification shown near the bottom of the canvas.
 type Toast struct {

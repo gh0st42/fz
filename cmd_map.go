@@ -1364,6 +1364,7 @@ func drawMinimap(s *mapState) {
 func runMap(args []string) error {
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagWindowHighdpi)
 	rl.InitWindow(virtualW*2, virtualH*2, "fz map")
+	fixRetinaStartupScale()
 	rl.SetTargetFPS(60)
 	defer rl.CloseWindow()
 
