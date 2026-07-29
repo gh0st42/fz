@@ -141,11 +141,9 @@ func drawTileTransformed(tex rl.Texture2D, ti, columns, tileSize int, dst rl.Rec
 	srcW := float32(tileSize)
 	srcH := float32(tileSize)
 	if flipH {
-		srcX += srcW
 		srcW = -srcW
 	}
 	if flipV {
-		srcY += srcH
 		srcH = -srcH
 	}
 	// Move dest to its own centre so the origin offset cancels for rotation=0
