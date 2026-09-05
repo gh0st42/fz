@@ -58,11 +58,15 @@ type mapSnapshot struct {
 type layerKind int
 
 const (
-	layerKindTile   layerKind = iota
-	layerKindObject           // name starts with "_"
+	layerKindTile    layerKind = iota
+	layerKindObject            // name starts with "_"
+	layerKindSpecial           // name starts with "#" — encounter/marker IDs, not tile GIDs
 )
 
 func kindFromName(name string) layerKind {
+	if strings.HasPrefix(name, "#") {
+		return layerKindSpecial
+	}
 	if strings.HasPrefix(name, "_") {
 		return layerKindObject
 	}
@@ -160,8 +164,8 @@ type mapLayer struct {
 	visible bool
 	class   string
 	kind    layerKind
-	data    []uint32    // tile GIDs (len = mapW*mapH); nil for object layers
-	objects []mapObject // rect objects; nil for tile layers
+	data    []uint32    // tile GIDs (layerKindTile) or plain 0-255 marker IDs (layerKindSpecial); len = mapW*mapH; nil for object layers
+	objects []mapObject // rect objects; nil for tile/special layers
 }
 
 type mapResizeDialog struct {
@@ -254,6 +258,11 @@ type mapState struct {
 	lastClickTime float64
 	lastClickType int // 1=name area 2=id area (for double-click detection)
 
+	// Special layer editing — marker ID (0-255) painted into layerKindSpecial cells
+	selectedSpecialID int
+	specialIDEditing   bool
+	specialIDText      string
+
 	// Object drag-to-draw state
 	objDragActive     bool
 	objDragX0, objDragY0 int
@@ -333,7 +342,7 @@ func (s *mapState) markClean() {
 func (s *mapState) takeMapSnapshot() mapSnapshot {
 	snap := mapSnapshot{mapW: s.mapW, mapH: s.mapH, data: make([][]uint32, len(s.layers))}
 	for i, l := range s.layers {
-		if l.kind == layerKindTile && len(l.data) > 0 {
+		if (l.kind == layerKindTile || l.kind == layerKindSpecial) && len(l.data) > 0 {
 			d := make([]uint32, len(l.data))
 			copy(d, l.data)
 			snap.data[i] = d
@@ -349,7 +358,7 @@ func (s *mapState) applyMapSnapshot(snap mapSnapshot) {
 		if i >= len(s.layers) || d == nil {
 			continue
 		}
-		if s.layers[i].kind == layerKindTile {
+		if s.layers[i].kind == layerKindTile || s.layers[i].kind == layerKindSpecial {
 			s.layers[i].data = make([]uint32, len(d))
 			copy(s.layers[i].data, d)
 		}
@@ -689,7 +698,11 @@ func loadMapTMJ(s *mapState, path string) error {
 		layer := mapLayer{name: jl.Name, visible: jl.Visible, class: jl.Class}
 		switch jl.Type {
 		case "tilelayer":
-			layer.kind = layerKindTile
+			if strings.HasPrefix(jl.Name, "#") {
+				layer.kind = layerKindSpecial
+			} else {
+				layer.kind = layerKindTile
+			}
 			if len(jl.Data) == sz {
 				layer.data = jl.Data
 			} else {
@@ -864,7 +877,7 @@ func saveMapTMJ(s *mapState, path string) error {
 		}
 
 		switch layer.kind {
-		case layerKindTile:
+		case layerKindTile, layerKindSpecial:
 			lset("type", "tilelayer")
 			lset("width", s.mapW)
 			lset("height", s.mapH)
@@ -1072,7 +1085,7 @@ func (s *mapState) layerAdd() {
 	name := fmt.Sprintf("layer %d", len(s.layers)+1)
 	kind := kindFromName(name)
 	l := mapLayer{name: name, visible: true, kind: kind}
-	if kind == layerKindTile {
+	if kind == layerKindTile || kind == layerKindSpecial {
 		l.data = make([]uint32, s.mapW*s.mapH)
 	} else {
 		l.objects = []mapObject{}
@@ -1150,12 +1163,14 @@ func (s *mapState) layerRenameConfirm() {
 	newKind := kindFromName(name)
 	if l.kind != newKind {
 		l.kind = newKind
-		if newKind == layerKindTile {
-			l.data = make([]uint32, s.mapW*s.mapH)
-			l.objects = nil
-		} else {
+		if newKind == layerKindObject {
 			l.data = nil
 			l.objects = []mapObject{}
+		} else {
+			// Tile <-> Special (or first assignment): reset data so old GIDs
+			// aren't misread as marker IDs (or vice versa).
+			l.data = make([]uint32, s.mapW*s.mapH)
+			l.objects = nil
 		}
 	}
 	s.renaming = false
@@ -1203,6 +1218,27 @@ func renderMinimap(s *mapState) {
 					)
 					drawTileTransformed(s.sheetTex, ti, s.sheetColumns, s.tileSize, dst,
 						p.flipH, p.flipV, p.rotation, rl.White)
+				}
+			}
+		}
+
+		// Special layers: flat colored tint per marked cell (numbers not legible at this scale).
+		for li := len(s.layers) - 1; li >= 0; li-- {
+			layer := &s.layers[li]
+			if !layer.visible || layer.kind != layerKindSpecial || len(layer.data) == 0 {
+				continue
+			}
+			c := layerAutoColor(li)
+			fill := rl.NewColor(c.R, c.G, c.B, 160)
+			for row := 0; row < s.mapH; row++ {
+				for col := 0; col < s.mapW; col++ {
+					if layer.data[row*s.mapW+col] == 0 {
+						continue
+					}
+					rl.DrawRectangle(
+						int32(float32(col)*tileW), int32(float32(row)*tileH),
+						int32(tileW)+1, int32(tileH)+1, fill,
+					)
 				}
 			}
 		}
@@ -1378,7 +1414,8 @@ func runMap(args []string) error {
 	state := &mapState{
 		mapW: 32, mapH: 32, tileSize: 16, zoom: 2,
 		showGrid: true, activeTool: toolPencil,
-		selectedObj: -1,
+		selectedObj:       -1,
+		selectedSpecialID: 1,
 		minimapX: virtualW - mmSize - 2*mmBorder - 4,
 		minimapY: toolbarH + 4,
 		iconCCW:  iconCCW,
@@ -1599,6 +1636,8 @@ func drawMapHelpOverlay() {
 			{"Page Up / Down", "Cycle active layer"},
 			{"Space", "Toggle active layer visibility"},
 			{"Dbl-click name", "Rename layer"},
+			{"_ prefix", "Object layer"},
+			{"# prefix", "Special marker layer"},
 		}},
 		{"Objects (object layer)", []row{
 			{"Drag on map", "Draw rect object"},
@@ -1699,6 +1738,7 @@ func drawMapViewport(s *mapState) {
 	vx, vy, vw, vh := s.vpRect()
 	rl.DrawRectangle(vx, vy, vw, vh, rl.NewColor(18, 18, 24, 255))
 	drawMapTileLayers(s)
+	drawMapSpecialLayers(s)
 	drawMapObjectLayers(s)
 
 	cellSz := int32(0)
@@ -1733,12 +1773,28 @@ func drawMapViewport(s *mapState) {
 			s.hoverValid = true
 			hx := vx + int32(col)*cellSz
 			hy := vy + int32(row)*cellSz
-			// Ghost tile preview for pencil and bucket tools
-			if (s.activeTool == toolPencil || s.activeTool == toolBucket) && s.sheetTex.ID > 0 && s.sheetColumns > 0 {
-				if s.activeLayer < len(s.layers) && s.layers[s.activeLayer].kind == layerKindTile {
-					dst := rl.NewRectangle(float32(hx), float32(hy), float32(cellSz), float32(cellSz))
-					drawTileTransformed(s.sheetTex, s.selectedTile, s.sheetColumns, s.tileSize, dst,
-						s.tileFlipH, s.tileFlipV, float32(s.tileRotation)*90, rl.NewColor(255, 255, 255, 160))
+			// Ghost tile / marker preview for pencil and bucket tools
+			if (s.activeTool == toolPencil || s.activeTool == toolBucket) && s.activeLayer < len(s.layers) {
+				switch s.layers[s.activeLayer].kind {
+				case layerKindTile:
+					if s.sheetTex.ID > 0 && s.sheetColumns > 0 {
+						dst := rl.NewRectangle(float32(hx), float32(hy), float32(cellSz), float32(cellSz))
+						drawTileTransformed(s.sheetTex, s.selectedTile, s.sheetColumns, s.tileSize, dst,
+							s.tileFlipH, s.tileFlipV, float32(s.tileRotation)*90, rl.NewColor(255, 255, 255, 160))
+					}
+				case layerKindSpecial:
+					c := layerAutoColor(s.activeLayer)
+					rl.DrawRectangle(hx, hy, cellSz, cellSz, rl.NewColor(c.R, c.G, c.B, 100))
+					label := strconv.Itoa(s.selectedSpecialID)
+					fontSz := cellSz / 2
+					if fontSz < 8 {
+						fontSz = 8
+					}
+					if fontSz > 16 {
+						fontSz = 16
+					}
+					tw := rl.MeasureText(label, fontSz)
+					rl.DrawText(label, hx+(cellSz-tw)/2, hy+(cellSz-fontSz)/2, fontSz, rl.NewColor(255, 255, 255, 200))
 				}
 			}
 			rl.DrawRectangleLines(hx, hy, cellSz, cellSz, rl.NewColor(255, 255, 100, 180))
@@ -1920,9 +1976,74 @@ func drawMapTileLayers(s *mapState) {
 	}
 }
 
+// drawMapSpecialLayers renders layerKindSpecial layers as a translucent,
+// per-layer-colored tint with the marker ID number drawn on each non-zero cell.
+// Used to mark areas (e.g. enemy encounter zones) without needing tileset art.
+func drawMapSpecialLayers(s *mapState) {
+	cellSz := s.tileSize * s.zoom
+	if cellSz <= 0 || s.mapW <= 0 || s.mapH <= 0 {
+		return
+	}
+	vx, vy, vw, vh := s.vpRect()
+	visW := int(vw)/cellSz + 1
+	visH := int(vh)/cellSz + 1
+
+	viewRight := int(vx) + int(vw)
+	viewBottom := int(vy) + int(vh)
+
+	fontSz := int32(cellSz) / 2
+	if fontSz < 8 {
+		fontSz = 8
+	}
+	if fontSz > 16 {
+		fontSz = 16
+	}
+
+	for li := len(s.layers) - 1; li >= 0; li-- {
+		layer := s.layers[li]
+		if !layer.visible || layer.kind != layerKindSpecial || len(layer.data) == 0 {
+			continue
+		}
+		c := layerAutoColor(li)
+		fill := rl.NewColor(c.R, c.G, c.B, 130)
+		for ty := 0; ty < visH; ty++ {
+			screenY := int(vy) + ty*cellSz
+			if screenY >= viewBottom {
+				break
+			}
+			mapY := s.scrollY + ty
+			if mapY < 0 || mapY >= s.mapH {
+				continue
+			}
+			for tx := 0; tx < visW; tx++ {
+				screenX := int(vx) + tx*cellSz
+				if screenX >= viewRight {
+					break
+				}
+				mapX := s.scrollX + tx
+				if mapX < 0 || mapX >= s.mapW {
+					continue
+				}
+				id := layer.data[mapY*s.mapW+mapX]
+				if id == 0 {
+					continue
+				}
+				rl.DrawRectangle(int32(screenX), int32(screenY), int32(cellSz), int32(cellSz), fill)
+				label := strconv.Itoa(int(id))
+				tw := rl.MeasureText(label, fontSz)
+				lx := int32(screenX) + (int32(cellSz)-tw)/2
+				ly := int32(screenY) + (int32(cellSz)-fontSz)/2
+				rl.DrawText(label, lx, ly, fontSz, rl.White)
+			}
+		}
+	}
+}
+
 // ── object layer rendering ────────────────────────────────────────────────────
 
-var objLayerPalette = []rl.Color{
+// layerAutoPalette provides deterministic per-layer colors (by absolute layer
+// index) for object-layer rectangles and special-layer marker tinting.
+var layerAutoPalette = []rl.Color{
 	rl.NewColor(255, 100, 100, 255),
 	rl.NewColor(100, 220, 100, 255),
 	rl.NewColor(100, 160, 255, 255),
@@ -1933,8 +2054,8 @@ var objLayerPalette = []rl.Color{
 	rl.NewColor(180, 180, 180, 255),
 }
 
-func objLayerColor(layerIdx int) rl.Color {
-	return objLayerPalette[layerIdx%len(objLayerPalette)]
+func layerAutoColor(layerIdx int) rl.Color {
+	return layerAutoPalette[layerIdx%len(layerAutoPalette)]
 }
 
 func drawMapObjectLayers(s *mapState) {
@@ -1950,7 +2071,7 @@ func drawMapObjectLayers(s *mapState) {
 		if !layer.visible || layer.kind != layerKindObject {
 			continue
 		}
-		c := objLayerColor(li)
+		c := layerAutoColor(li)
 		fill := rl.NewColor(c.R, c.G, c.B, 45)
 		border := rl.NewColor(c.R, c.G, c.B, 200)
 		label := rl.NewColor(c.R, c.G, c.B, 230)
@@ -1987,7 +2108,7 @@ func drawMapObjectLayers(s *mapState) {
 		sy := int32(float32(vy) + float32(y0-s.scrollY)*cellSz)
 		sw := int32(float32(x1-x0+1) * cellSz)
 		sh := int32(float32(y1-y0+1) * cellSz)
-		c := objLayerColor(s.activeLayer)
+		c := layerAutoColor(s.activeLayer)
 		rl.DrawRectangle(sx, sy, sw, sh, rl.NewColor(c.R, c.G, c.B, 60))
 		rl.DrawRectangleLines(sx, sy, sw, sh, rl.NewColor(c.R, c.G, c.B, 255))
 	}
@@ -2030,10 +2151,14 @@ func drawMapBelowLayers(s *mapState) {
 		// Kind badge
 		var badgeCol rl.Color
 		var badgeTxt string
-		if layer.kind == layerKindTile {
+		switch layer.kind {
+		case layerKindTile:
 			badgeCol = rl.NewColor(70, 130, 180, 255)
 			badgeTxt = "T"
-		} else {
+		case layerKindSpecial:
+			badgeCol = layerAutoColor(i)
+			badgeTxt = "#"
+		default:
 			badgeCol = rl.NewColor(180, 130, 60, 255)
 			badgeTxt = "O"
 		}
@@ -2176,12 +2301,17 @@ func mapToolBtn(r rl.Rectangle, icon string, tool, active drawTool) bool {
 }
 
 func drawMapRightPanel(s *mapState) {
-	if s.activeLayer >= 0 && s.activeLayer < len(s.layers) &&
-		s.layers[s.activeLayer].kind == layerKindObject {
-		drawMapObjectPanel(s)
-	} else {
-		drawMapTilePanel(s)
+	if s.activeLayer >= 0 && s.activeLayer < len(s.layers) {
+		switch s.layers[s.activeLayer].kind {
+		case layerKindObject:
+			drawMapObjectPanel(s)
+			return
+		case layerKindSpecial:
+			drawMapSpecialPanel(s)
+			return
+		}
 	}
+	drawMapTilePanel(s)
 }
 
 // ── object panel ──────────────────────────────────────────────────────────────
@@ -2206,7 +2336,7 @@ func drawMapObjectPanel(s *mapState) {
 		return
 	}
 	layer := &s.layers[s.activeLayer]
-	c := objLayerColor(s.activeLayer)
+	c := layerAutoColor(s.activeLayer)
 
 	// List background
 	rl.DrawRectangle(listX, listY, listW, listH, rl.NewColor(28, 28, 35, 255))
@@ -2559,13 +2689,88 @@ func drawMapTilePanel(s *mapState) {
 	drawMapTileSheet(s)
 }
 
+// ── special (marker) panel ────────────────────────────────────────────────────
+
+// drawMapSpecialPanel is shown in the right panel when the active layer is a
+// layerKindSpecial layer (name starts with "#"). It replaces the tileset
+// picker with a single 0-255 marker-ID selector, since special layers paint
+// plain IDs rather than tileset GIDs. Pencil/eraser/bucket still apply.
+func drawMapSpecialPanel(s *mapState) {
+	const bsz = float32(24)
+	step := bsz + 4
+
+	lw := rl.MeasureText("TOOLS", 10)
+	rl.DrawText("TOOLS", panelX+(panelW-lw)/2, mapRToolsLabelY, 10, rl.NewColor(180, 180, 180, 255))
+
+	x := float32(panelX + 4)
+	y1 := float32(mapRTools1Y)
+	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_PENCIL, ""), toolPencil, s.activeTool) {
+		s.activeTool = toolPencil
+	}
+	x += step
+	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_RUBBER, ""), toolEraser, s.activeTool) {
+		s.activeTool = toolEraser
+	}
+	x += step
+	if mapToolBtn(rl.NewRectangle(x, y1, bsz, bsz), raygui.IconText(raygui.ICON_COLOR_BUCKET, ""), toolBucket, s.activeTool) {
+		s.activeTool = toolBucket
+	}
+
+	sepX := int32(panelX + 4)
+	sepW := int32(panelW - 8)
+	rl.DrawLine(sepX, mapRToolsSepY, sepX+sepW, mapRToolsSepY, rl.NewColor(55, 55, 70, 255))
+
+	lbl := "MARKER ID"
+	lw2 := rl.MeasureText(lbl, 10)
+	rl.DrawText(lbl, panelX+(panelW-lw2)/2, mapRTilesetLblY, 10, rl.NewColor(180, 180, 180, 255))
+
+	c := layerAutoColor(s.activeLayer)
+	const swSz = int32(48)
+	swX := panelX + (panelW-swSz)/2
+	swY := mapRTilesetDropY + 6
+	rl.DrawRectangle(swX, swY, swSz, swSz, rl.NewColor(c.R, c.G, c.B, 160))
+	rl.DrawRectangleLines(swX, swY, swSz, swSz, rl.NewColor(c.R, c.G, c.B, 255))
+
+	idStr := strconv.Itoa(s.selectedSpecialID)
+	if s.specialIDEditing {
+		idStr = s.specialIDText + "_"
+	}
+	idFontSz := int32(20)
+	idw := rl.MeasureText(idStr, idFontSz)
+	rl.DrawText(idStr, swX+(swSz-idw)/2, swY+(swSz-idFontSz)/2, idFontSz, rl.White)
+
+	mouse := rl.GetMousePosition()
+	swRect := rl.NewRectangle(float32(swX), float32(swY), float32(swSz), float32(swSz))
+	if !s.mouseOverMinimap() && rl.CheckCollisionPointRec(mouse, swRect) {
+		if !s.specialIDEditing && rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+			s.specialIDEditing = true
+			s.specialIDText = strconv.Itoa(s.selectedSpecialID)
+		}
+		if !s.specialIDEditing {
+			if wheel := rl.GetMouseWheelMove(); wheel != 0 {
+				s.selectedSpecialID += int(wheel)
+				if s.selectedSpecialID < 0 {
+					s.selectedSpecialID = 0
+				}
+				if s.selectedSpecialID > 255 {
+					s.selectedSpecialID = 255
+				}
+			}
+		}
+	}
+
+	hint := "click to type, wheel to nudge"
+	hw := rl.MeasureText(hint, 8)
+	rl.DrawText(hint, panelX+(panelW-hw)/2, swY+swSz+6, 8, rl.NewColor(120, 120, 135, 255))
+}
+
 func drawMapTilesetDropdown(s *mapState) {
 	if s.resize.active || s.saveActive || s.exportActive || s.mapDropEdit {
 		return
 	}
 	// Only visible in tile-layer mode
 	if s.activeLayer >= 0 && s.activeLayer < len(s.layers) &&
-		s.layers[s.activeLayer].kind == layerKindObject {
+		s.layers[s.activeLayer].kind != layerKindTile {
 		return
 	}
 	dropX := float32(panelX + 4)
@@ -2929,6 +3134,8 @@ func exportMapFlat(s *mapState, path string) error {
 			}
 		}
 	}
+	// Special (marker) layers are editor-only annotations and are intentionally
+	// excluded from the flat PNG export — only regular tile layers are baked in.
 	rl.EndTextureMode()
 
 	// RenderTexture Y axis is flipped relative to image conventions.
@@ -2955,8 +3162,11 @@ func drawMapStatusBar(s *mapState) {
 	if s.activeLayer < len(s.layers) {
 		l := s.layers[s.activeLayer]
 		kind := "tile"
-		if l.kind == layerKindObject {
+		switch l.kind {
+		case layerKindObject:
 			kind = "obj"
+		case layerKindSpecial:
+			kind = "special"
 		}
 		layerName = fmt.Sprintf("%s (%s)", l.name, kind)
 	}
@@ -3026,11 +3236,13 @@ func (s *mapState) applyTileDraw(mx, my int, erase bool) {
 		return
 	}
 	layer := &s.layers[s.activeLayer]
-	if layer.kind != layerKindTile || len(layer.data) == 0 {
+	if (layer.kind != layerKindTile && layer.kind != layerKindSpecial) || len(layer.data) == 0 {
 		return
 	}
 	if erase {
 		layer.data[my*s.mapW+mx] = 0
+	} else if layer.kind == layerKindSpecial {
+		layer.data[my*s.mapW+mx] = uint32(s.selectedSpecialID)
 	} else {
 		firstGID := s.tilesetFirstGID
 		if firstGID <= 0 {
@@ -3043,13 +3255,14 @@ func (s *mapState) applyTileDraw(mx, my int, erase bool) {
 }
 
 // floodFill replaces all tiles connected to (startX, startY) that share the
-// same GID with newGID (0 = erase, >0 = tile index+1).
+// same GID with newGID (0 = erase, >0 = tile index+1). For special layers,
+// newGID is a plain 0-255 marker ID rather than an encoded GID.
 func (s *mapState) floodFill(startX, startY int, newGID uint32) {
 	if s.activeLayer >= len(s.layers) {
 		return
 	}
 	layer := &s.layers[s.activeLayer]
-	if layer.kind != layerKindTile || len(layer.data) == 0 {
+	if (layer.kind != layerKindTile && layer.kind != layerKindSpecial) || len(layer.data) == 0 {
 		return
 	}
 	if startX < 0 || startX >= s.mapW || startY < 0 || startY >= s.mapH {
@@ -3108,6 +3321,10 @@ func handleMapInput(s *mapState, dt float64) {
 	}
 	if s.objRenaming || s.objIDEditing {
 		handleMapObjRenameInput(s)
+		return
+	}
+	if s.specialIDEditing {
+		handleMapSpecialIDInput(s)
 		return
 	}
 	if s.showHelp {
@@ -3184,7 +3401,8 @@ func handleMapInput(s *mapState, dt float64) {
 		if s.activeLayer < len(s.layers) {
 			layer = s.activeLayer
 		}
-		if layer >= 0 && s.layers[layer].kind == layerKindTile {
+		if layer >= 0 && (s.layers[layer].kind == layerKindTile || s.layers[layer].kind == layerKindSpecial) {
+			isSpecial := s.layers[layer].kind == layerKindSpecial
 			// Push one undo entry at the start of each pencil/eraser stroke.
 			if rl.IsMouseButtonPressed(rl.MouseButtonLeft) &&
 				(s.activeTool == toolPencil || s.activeTool == toolEraser) {
@@ -3202,43 +3420,52 @@ func handleMapInput(s *mapState, dt float64) {
 			case toolBucket:
 				if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 					s.pushMapUndo()
+					var newVal uint32
+					if isSpecial {
+						newVal = uint32(s.selectedSpecialID)
+					} else {
+						firstGID := s.tilesetFirstGID
+						if firstGID <= 0 {
+							firstGID = 1
+						}
+						newVal = uint32(s.selectedTile+firstGID) | tileGIDFlags(s.tileFlipH, s.tileFlipV, s.tileRotation)
+					}
+					s.floodFill(s.hoverX, s.hoverY, newVal)
+				}
+			}
+			// Right-click: pick tile/marker value from the map layer
+			if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+				val := s.layers[layer].data[s.hoverY*s.mapW+s.hoverX]
+				if isSpecial {
+					s.selectedSpecialID = int(val & 0xFF)
+				} else {
+					rawID := val &^ gidFlagMask
 					firstGID := s.tilesetFirstGID
 					if firstGID <= 0 {
 						firstGID = 1
 					}
-					gid := uint32(s.selectedTile+firstGID) | tileGIDFlags(s.tileFlipH, s.tileFlipV, s.tileRotation)
-					s.floodFill(s.hoverX, s.hoverY, gid)
-				}
-			}
-			// Right-click: pick tile + transform from the map layer
-			if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
-				gid := s.layers[layer].data[s.hoverY*s.mapW+s.hoverX]
-				rawID := gid &^ gidFlagMask
-				firstGID := s.tilesetFirstGID
-				if firstGID <= 0 {
-					firstGID = 1
-				}
-				if rawID >= uint32(firstGID) {
-					ti := int(rawID) - firstGID
-					if s.sheetColumns > 0 {
-						maxTile := s.sheetColumns * (s.sheetSz / s.tileSize)
-						if ti >= 0 && ti < maxTile {
-							s.selectedTile = ti
-							// Decode the stored flip+rotation flags back to editing state.
-							// Use the canonical representative for each (H,V,D) combination.
-							flags := gid & gidFlagMask
-							p := gidToRenderParams(flags)
-							s.tileFlipH = p.flipH
-							s.tileFlipV = p.flipV
-							switch p.rotation {
-							case 90:
-								s.tileRotation = 1
-							case 180:
-								s.tileRotation = 2
-							case 270:
-								s.tileRotation = 3
-							default:
-								s.tileRotation = 0
+					if rawID >= uint32(firstGID) {
+						ti := int(rawID) - firstGID
+						if s.sheetColumns > 0 {
+							maxTile := s.sheetColumns * (s.sheetSz / s.tileSize)
+							if ti >= 0 && ti < maxTile {
+								s.selectedTile = ti
+								// Decode the stored flip+rotation flags back to editing state.
+								// Use the canonical representative for each (H,V,D) combination.
+								flags := val & gidFlagMask
+								p := gidToRenderParams(flags)
+								s.tileFlipH = p.flipH
+								s.tileFlipV = p.flipV
+								switch p.rotation {
+								case 90:
+									s.tileRotation = 1
+								case 180:
+									s.tileRotation = 2
+								case 270:
+									s.tileRotation = 3
+								default:
+									s.tileRotation = 0
+								}
 							}
 						}
 					}
@@ -3394,6 +3621,41 @@ func handleMapObjRenameInput(s *mapState) {
 			s.objRenameText += string(c)
 		}
 	}
+}
+
+// handleMapSpecialIDInput processes the text-edit box for the active special
+// layer's paint ID (see drawMapSpecialPanel).
+func handleMapSpecialIDInput(s *mapState) {
+	if rl.IsKeyPressed(rl.KeyEnter) {
+		s.confirmSpecialIDEdit()
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		s.specialIDEditing = false
+		return
+	}
+	if rl.IsKeyPressed(rl.KeyBackspace) && len(s.specialIDText) > 0 {
+		s.specialIDText = s.specialIDText[:len(s.specialIDText)-1]
+	}
+	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+		if c >= '0' && c <= '9' && len(s.specialIDText) < 3 {
+			s.specialIDText += string(c)
+		}
+	}
+}
+
+func (s *mapState) confirmSpecialIDEdit() {
+	v, err := strconv.Atoi(s.specialIDText)
+	if err == nil {
+		if v < 0 {
+			v = 0
+		}
+		if v > 255 {
+			v = 255
+		}
+		s.selectedSpecialID = v
+	}
+	s.specialIDEditing = false
 }
 
 func (s *mapState) confirmObjIDEdit() {
