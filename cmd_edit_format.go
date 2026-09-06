@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ── Lua formatting ────────────────────────────────────────────────────────────
@@ -114,4 +115,69 @@ func edFirstLine(s string) string {
 		return strings.TrimSpace(s[:i])
 	}
 	return s
+}
+
+// ── formatting on save ────────────────────────────────────────────────────────
+
+// edFormatOnSave tidies the buffer whenever it is written, so what lands on
+// disk is what the formatter would produce and a file never drifts between
+// saves. Some people want to decide when that happens, hence the Options entry.
+var edFormatOnSave = true
+
+// edFormatSaveWait is how long a save will wait for the formatter. Formatting
+// takes tens of milliseconds in practice; the limit is there so that a wedged
+// tool delays the write by a moment rather than hanging the editor, and the
+// save still goes ahead with the text as it stands.
+const edFormatSaveWait = 1500 * time.Millisecond
+
+// edFormatBeforeSave rewrites the buffer in place, as one undoable edit, unless
+// formatting is switched off, the file is not Lua, or the formatter declines.
+// It is deliberately synchronous: the point is that the bytes being written are
+// the formatted ones.
+func edFormatBeforeSave(s *edState, path string) {
+	if !edFormatOnSave || !strings.EqualFold(filepath.Ext(path), ".lua") {
+		return
+	}
+	formatter := edPickFormatter()
+	if formatter.kind == edFmtNone {
+		return
+	}
+
+	src := strings.Join(s.lines, "\n")
+	done := make(chan edFmtResult, 1)
+	go func() {
+		text, err := formatter.format(path, src)
+		done <- edFmtResult{text: text, name: formatter.name, err: err}
+	}()
+
+	var res edFmtResult
+	select {
+	case res = <-done:
+	case <-time.After(edFormatSaveWait):
+		s.toast.Notify("Saved unformatted: " + formatter.name + " did not answer")
+		return
+	}
+
+	if res.err != nil {
+		// Usually a syntax error, which the formatter cannot do anything with.
+		// Saving anyway is the right call: the text is the user's.
+		s.toast.Notify("Saved unformatted: " + edFirstLine(res.err.Error()))
+		return
+	}
+	text := strings.ReplaceAll(res.text, "\r\n", "\n")
+	if text == src {
+		return
+	}
+
+	line, col := s.cy, s.cx
+	s.beginEdit(false)
+	s.lines = strings.Split(text, "\n")
+	s.cy = max(0, min(line, len(s.lines)-1))
+	s.cx = min(col, s.lineLen(s.cy))
+	s.goalX = s.cx
+	s.hasSel = false
+	s.touch()
+	s.focus = edFocusWhole()
+	s.refocus()
+	s.ensureVisible()
 }

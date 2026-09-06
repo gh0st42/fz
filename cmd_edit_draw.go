@@ -145,6 +145,11 @@ func edDrawText(s *edState) {
 	}
 
 	top, bottom := s.viewTop(), s.viewBottom()
+	var guides []int
+	if s.showGuides {
+		guides = edGuideDepths(s.lines, top+s.scrollY, min(bottom, top+s.scrollY+edRows-1))
+	}
+
 	for row := 0; row < edRows; row++ {
 		ln := top + s.scrollY + row
 		if ln > bottom {
@@ -163,6 +168,9 @@ func edDrawText(s *edState) {
 
 		if s.focus.sealed(ln) {
 			rl.DrawRectangle(x0, y, edVScrX-x0-edPad, edTxtLineH, edClrSealed)
+		}
+		if row < len(guides) {
+			edDrawGuides(s, guides[row], x0, y)
 		}
 
 		runes := s.runes(ln)
@@ -193,7 +201,52 @@ func edDrawText(s *edState) {
 		}
 	}
 
+	edDrawBlockMatch(s)
 	edDrawCursor(s)
+}
+
+// edDrawGuides rules a faint line down each level of indentation on one row.
+func edDrawGuides(s *edState, indent int, x0, y int32) {
+	for col := s.indentWidth; col < indent; col += s.indentWidth {
+		if col < s.scrollX {
+			continue
+		}
+		x := x0 + int32(col-s.scrollX)*edTxtCharW
+		if x >= edVScrX-edPad {
+			break
+		}
+		rl.DrawRectangle(x, y, 1, edTxtLineH, edClrGuide)
+	}
+}
+
+// edDrawBlockMatch boxes the keyword under the caret and the one that closes
+// it, so an "end" can be told from the block it belongs to at a glance.
+func edDrawBlockMatch(s *edState) {
+	if s.dlg != edDlgNone || s.showHelp {
+		return
+	}
+	a, b, ok := edMatchBlock(s)
+	if !ok {
+		return
+	}
+	edOutlineSpan(s, a)
+	edOutlineSpan(s, b)
+}
+
+// edOutlineSpan draws a box around one keyword, when it is on screen.
+func edOutlineSpan(s *edState, span edBlockSpan) {
+	row := span.line - s.viewTop() - s.scrollY
+	if row < 0 || row >= edRows {
+		return
+	}
+	from := max(span.from, s.scrollX)
+	to := min(span.to, s.scrollX+edCols(s))
+	if to <= from {
+		return
+	}
+	x := edTextX0(s) + int32(from-s.scrollX)*edTxtCharW
+	y := edTextY0 + int32(row)*edTxtLineH
+	rl.DrawRectangleLines(x-1, y, int32(to-from)*edTxtCharW+2, edTxtLineH, edClrMatch)
 }
 
 func edDrawCursor(s *edState) {
@@ -489,6 +542,8 @@ func edMenuItemChecked(s *edState, act edAction) bool {
 		return s.showLineNums
 	case edActSyntax:
 		return s.showSyntax
+	case edActGuides:
+		return s.showGuides
 	case edActFocus:
 		return s.focusMode
 	case edActFontUnscii:
@@ -499,6 +554,8 @@ func edMenuItemChecked(s *edState, act edAction) bool {
 		return edUseLSP
 	case edActForceStylua:
 		return edForceStylua
+	case edActFormatOnSave:
+		return edFormatOnSave
 	case edActAutoClose:
 		return edAutoClose
 	}

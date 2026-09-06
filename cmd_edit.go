@@ -50,6 +50,11 @@ var (
 	// Problem markers: errors shout, lints murmur.
 	edClrError = rl.NewColor(255, 85, 85, 255)
 	edClrWarn  = rl.NewColor(255, 255, 85, 255)
+
+	// Indent guides sit just above the background; the box around a matched
+	// pair of block keywords stands out from it.
+	edClrGuide = rl.NewColor(48, 48, 160, 255)
+	edClrMatch = rl.NewColor(120, 200, 255, 255)
 )
 
 // edKindColor maps a highlighter token kind to its on-screen colour.
@@ -480,9 +485,11 @@ const (
 	edActOutline
 	edActLineNums
 	edActSyntax
+	edActGuides
 	edActFocus
 	edActUseLSP
 	edActForceStylua
+	edActFormatOnSave
 	edActNextProblem
 	edActFontUnscii
 	edActFontVGA
@@ -556,6 +563,7 @@ type edState struct {
 	// ── view options ──
 	showLineNums bool
 	showSyntax   bool
+	showGuides   bool
 	showHelp     bool
 	indentWidth  int     // spaces per indent step, detected per document
 	focusMode    bool    // show one function at a time
@@ -734,6 +742,7 @@ var edMenus = []edMenu{
 	{"View", []edMenuItem{
 		{"Line Numbers", "", edActLineNums},
 		{"Syntax Colors", "", edActSyntax},
+		{"Indent Guides", "", edActGuides},
 		{"", "", edActNone},
 		{"Function Focus", "F8", edActFocus},
 	}},
@@ -757,6 +766,7 @@ var edMenus = []edMenu{
 	{"Options", []edMenuItem{
 		{"Language Server", "", edActUseLSP},
 		{"Format with stylua", "", edActForceStylua},
+		{"Format on Save", "", edActFormatOnSave},
 		{"Auto-close Brackets", "", edActAutoClose},
 		{"Indent Width", "", edActIndentWidth},
 		{"", "", edActNone},
@@ -1444,6 +1454,8 @@ func edLoadFile(s *edState, path string) error {
 }
 
 func edSaveFile(s *edState, path string) error {
+	edFormatBeforeSave(s, path)
+
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -1534,6 +1546,7 @@ func runEdit(args []string) error {
 		assistDone:   make(chan edAssistResult, 4),
 		showLineNums: true,
 		showSyntax:   true,
+		showGuides:   true,
 		indentWidth:  edDefaultIndent,
 		menuOpen:     -1,
 		menuHover:    -1,
@@ -1837,6 +1850,9 @@ func edApply(s *edState, act edAction) {
 	case edActSyntax:
 		s.showSyntax = !s.showSyntax
 
+	case edActGuides:
+		s.showGuides = !s.showGuides
+
 	case edActFocus:
 		edToggleFocus(s)
 
@@ -1845,6 +1861,14 @@ func edApply(s *edState, act edAction) {
 
 	case edActForceStylua:
 		edToggleForceStylua(s)
+
+	case edActFormatOnSave:
+		edFormatOnSave = !edFormatOnSave
+		if edFormatOnSave {
+			s.toast.Notify("Formatting on save with " + edPickFormatter().name)
+		} else {
+			s.toast.Notify("Format on save off")
+		}
 
 	case edActNextProblem:
 		edNextProblem(s)
