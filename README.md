@@ -9,7 +9,8 @@ Its features include amongst other things the following:
 - Exports to the web via [love.js](https://github.com/Davidobot/love.js), and serves the result locally with the headers browsers require for `SharedArrayBuffer`
 - A project runner including auto-(re)launching after file changes (watch)
 - A tile-sheet editor (`fz gfx`)
-- A tile-map editor (`fz map`).
+- A tile-map editor (`fz map`)
+- A Lua source editor (`fz edit`).
 
 ## Installation
 
@@ -332,6 +333,112 @@ fz map /absolute/path/to/map.tmj   # open any TMJ by absolute path
 
 - **Multiple tilesets per map are not fully supported.** Only the first tileset entry is loaded. GIDs that belong to a second or later tileset will be looked up against the first sheet, producing wrong tiles. Maps with a single tileset work correctly.
 - Base64-encoded or compressed layer data (Tiled's "zlib", "gzip", "zstd" options) is not decoded; those layers will appear empty.
+
+### `fz edit [file]`
+
+Opens a Lua source editor built on the same virtual 640×480 canvas and raygui widgets as `fz gfx` and `fz map`, styled after Turbo Pascal / QBasic / PICO-8: a menu bar with red hotkey letters, an EGA-blue editing window and a key-hint status bar.
+
+```
+cd mygame
+fz edit                 # opens main.lua
+fz edit conf            # .lua is appended automatically
+fz edit retrolib        # bare names fall back to lib/retrolib.lua
+```
+
+Lua syntax highlighting covers keywords, standard-library and Love2D globals, strings (including `[[long]]` brackets), numbers and comments. Text is drawn on a fixed character grid with the bundled unscii-8 bitmap font.
+
+`Alt+F2` opens an outline of the file: every `function f()`, `local function f()`, `function M.f()` / `M:f()` and `f = function()` declaration, sorted by name and shown with its line number. Only the bare name is listed; scope shows in the colour instead — yellow for top-level functions visible to the whole project, cyan for top-level `local` ones, grey for functions declared inside another function, and white for the `(top of file)` entry. A nested one also names the top-level function it belongs to in its own column, however deeply it is nested. Declarations inside comments or long strings are skipped. The list always starts with a `(top of file)` entry, so it is never empty and there is always a jump back to line 1. The function around the cursor is preselected, and Enter (or **Go To**) jumps to it.
+
+**Fonts.** Two faces are embedded and switchable from the **Options** menu, each with its own ladder of sizes stepped by `Alt` `+` / `Alt` `-`:
+
+| Font | Sizes (cell) | Window at the default |
+|---|---|---|
+| unscii-8 (default) | 8 (8×12), 16 (16×24) | 72×34 |
+| IBM VGA | 10 (4×8), 12 (5×10), **16 (6×14)**, 18 (7×15), 19 (8×16), 24 (10×20), 38 (16×32) | 98×29 |
+
+Only the text scales: the menu bar, frame, dialogs and status bar stay at the face's default size, so the chrome keeps fitting the 640×480 canvas. A step that would leave fewer than 8 rows or 24 columns is refused.
+
+unscii-8 is an 8px bitmap face, so it has only its native size and a clean double. The VGA face is an outline approximation of an 8×16 cell drawn on a 1600-unit em, and rasterises unevenly wherever a design pixel does not land near a whole screen pixel — at 19, its nominal 8×16, some stems come out two pixels wide and others one. It therefore defaults to 16, which lands more evenly; step up twice for the authentic 8×16 cell and its 72×25 DOS window, or down for a denser view.
+
+The atlas covers ASCII, Latin-1 and Latin Extended-A plus common punctuation and the euro sign, so umlauts and accented text render rather than turning into `?` — both faces carry the glyphs. The window is laid out from the character cell, so it re-flows when you switch face or size. Neither choice is persisted. Both faces are rasterised with raylib's `FONT_BITMAP` mode, which thresholds glyph coverage instead of anti-aliasing it, so the pixels stay hard-edged.
+
+**Code assistance.** With `lua-language-server` on PATH the editor talks to it for four things: symbol bounds (above), completion, inline help and signature hints.
+
+- **Completion** — `Ctrl+Space`, and automatically after typing `.` or `:`. The popup filters as you keep typing, `↑`/`↓`/`PgUp`/`PgDn` move, `Enter` or `Tab` accepts as a single undoable edit, `Esc` dismisses. Without a language server it falls back to the identifiers already in the buffer plus Lua's own keywords, which is enough to finish a long name.
+- **Inline help** — `Ctrl+I` shows what the server knows about the symbol under the caret: signature, return type and doc comment, with the markdown flattened to the editor's one font.
+- **Signature hints** — typing `(` or `,` shows the call's parameter list on the line above the caret, with the argument you are currently filling in picked out in red. `)` dismisses it.
+
+Every request runs on a goroutine and carries a sequence number, so a reply that arrives after the caret has moved on is discarded rather than shown. The server is started and left to finish its workspace scan in the background when a file is opened — hover, completion and signature help are semantic and answer with a "Workspace loading" placeholder until that scan completes, unlike formatting and symbols, which are syntactic and answer immediately. If the server dies it is restarted on the next request rather than disabling assistance for the session.
+
+**Problems.** The language server publishes syntax errors and lints for the buffer as it is edited — the editor pushes the text 0.4 s after the typing settles rather than on every keystroke. Reported ranges are underlined and their line numbers coloured, red for errors and yellow for lints. Putting the caret on a reported line replaces the key hints in the status bar with the message; otherwise a short tally sits next to the position readout, `2E 3L` for two errors and three lints. `Ctrl+E` (or **Search → Next Problem**) jumps to the next one, wrapping.
+
+**Turning it off.** **Options → Language Server** switches the whole thing off, including the resident server process, which is worth doing on a machine where indexing a workspace costs more than the help is worth. With it off, completion falls back to the identifiers in the buffer, function bounds fall back to the line scanner, and diagnostics, hover and signature hints go away. Formatting still works if `stylua` is installed, since that is a separate program — with the server off it takes over automatically.
+
+**Function focus.** `F8` (or **View → Function Focus**) narrows the window to one function at a time, the way QBasic and VB showed a single procedure. The buffer still holds the whole file — focus is only a view — so line numbers stay real, the status bar keeps counting the whole document, and saving writes everything. `Alt+F2` switches between functions from the outline, and picking `(top of file)` steps back out to the module-level view. Putting the caret outside every function shows the whole file, which is how you navigate back in.
+
+The declaration and its closing `end` are read-only and tinted to say so: only the body and the text inside the parentheses can change, so a function cannot lose its shape from the inside. Line-wise operations (indent, comment toggle) skip the sealed lines rather than refusing outright. A comment block sitting directly above the declaration comes along with the function, so it arrives with its documentation.
+
+Bounds come from a Lua block scanner that counts `function` / `if` / `do` against `end`, consulting the syntax highlighter so keywords inside comments and strings do not count. When `lua-language-server` is installed, its `textDocument/documentSymbol` ranges are used instead; the request runs on a goroutine and the scanner's answer stands until it lands, so nothing waits on the server.
+
+**Running, and what happens when it breaks.** `F5` saves and launches the game, and the editor reads its output. When Lua reports an error the editor opens the file it names, puts the caret on the line, marks it red in the gutter and shows the message in the status bar — no hunting through a terminal. The error is kept apart from the language server's findings, so a later diagnostics publish cannot wipe it out; the next run clears it.
+
+One caveat worth knowing: love block-buffers its output when it is going to a pipe rather than a terminal, so nothing arrives while the crashed game is still on screen — the editor jumps to the fault the moment you close it. The game's output still reaches your terminal as before, and both streams are read, because love is not consistent about which one an error goes to.
+
+**Project and tools.** The **Project** menu runs the game (`F5`, same as `fz run`) and builds it (`F9`), calling `fz`'s own build straight from the editor — the archive is written on a background goroutine so the window keeps responding, and the result is reported in the status toast. The **Tools** menu opens the sprite (`fz gfx`) and map (`fz map`) editors; raylib allows one window per process, so each opens as its own `fz` process in the same working directory.
+
+**Search and replace.** `Ctrl+F` finds, `F4` repeats, and `Ctrl+H` replaces. The replace dialog has both fields at once — `Tab` or a click moves between them — with **Replace** for the highlighted match, **All** for every match, and `Enter` as a shortcut for Replace so you can walk a file without touching the mouse. Matching is case-insensitive like Find, replacements go in literally, and everything is confined to what the view currently shows, so a replace-all inside function focus cannot reach past the function on screen or rewrite its sealed declaration. Opening the dialog with a selection spanning several lines scopes **All** to those lines, which the title says. A replace-all is one undo step; one that matches nothing leaves no undo step at all.
+
+**Line editing.** `Ctrl+D` duplicates the caret's line or the selected block, `Alt+Up` / `Alt+Down` move it. Double-clicking selects the word under the pointer. Typing an opening bracket or quote writes its partner and puts the caret between them — typing the closer steps over it instead of doubling it, backspace between an empty pair takes both, wrapping a selection in brackets keeps the selection, and an apostrophe inside a word stays an apostrophe. **Options → Auto-close Brackets** turns that off for those who would rather it did not.
+
+**Indentation.** The indent step is read from the file itself on load — every place a line is indented deeper than the one before votes for that width, and the most-voted wins — so a four-space project keeps four spaces without being told. **Options → Indent Width** cycles 2, 4, 8 for the current buffer.
+
+**Comments.** `Ctrl` `/`, `Ctrl` `-` and `Ctrl` `B` all toggle Lua line comments (three bindings because which physical key yields `/` or `-` depends on the keyboard layout). With a selection it works across every line in it: if all of them are already commented the markers come off, otherwise `-- ` goes on, aligned to the shallowest indentation in the block so a mixed selection round-trips. Blank lines are left alone, a selection resting at column 0 does not reach that last line, and the caret and selection are kept over the same text.
+
+**Buffers.** Several files can be open at once. `F6` / `Alt+F6` cycle forward and back, `Alt+0` opens the buffer list, and `^W` closes the current buffer (the last one closing leaves an empty scratch buffer rather than exiting). Opening a file that is already open switches to it instead of loading a second copy. The frame title shows `[2/4] name.lua *` — position, file, and a marker when it has unsaved changes — and quitting warns if *any* buffer is dirty. The marker tracks the text rather than the fact that you typed: editing and then undoing back to the saved content, by hand or with `Ctrl+Z`, clears it again. The **Window** menu holds the same commands plus the list, whose **Close** button acts on the highlighted buffer.
+
+**Formatting.** `F7` (or **Edit → Format**) reformats the buffer in place as one undoable edit, keeping the cursor on its line and column. Two backends are possible and the choice is made per format, not fixed at startup:
+
+- `lua-language-server` over the LSP session (`textDocument/formatting`) is used when it is available and enabled — it is already running, and it formats to the same rules it lints by.
+- [stylua](https://github.com/JohnnyMorganz/StyLua) is used when **Options → Format with stylua** is ticked, and stands in whenever the server is unavailable or switched off. Worth forcing on a project that keeps a `stylua.toml`, since stylua reads it.
+
+With neither installed, `F7` says so and changes nothing; the override does nothing if stylua is not installed. The formatter in force is named at the bottom of the `F1` help page, and the toast after a format names the tool that actually did the work. Formatting runs off the render loop, so a slow tool never freezes the editor.
+
+**Keyboard shortcuts**
+
+| Key | Action |
+|---|---|
+| F2 / Ctrl+S | Save |
+| F12 / Ctrl+Shift+S | Save As |
+| F3 / Ctrl+O | Open |
+| Ctrl+N | New buffer |
+| F5 | Save and launch the game |
+| Ctrl+Q | Quit |
+| Ctrl+Z / Y | Undo / Redo |
+| Ctrl+X / C / V | Cut / Copy / Paste |
+| Ctrl+A | Select all |
+| Ctrl+F / F4 | Find / Find next |
+| Ctrl+G | Go to line |
+| Alt+F2 | Function outline — all functions in the file, sorted by name; Enter jumps |
+| F7 | Format the document (language server, or stylua) |
+| F6 / Alt+F6 | Next / previous buffer |
+| Alt+0 | Buffer list |
+| Alt++ / Alt+- | Step the text size up / down |
+| Ctrl+H | Replace |
+| Ctrl+D | Duplicate line or selection |
+| Alt+Up / Alt+Down | Move line or selection |
+| Ctrl+/ , Ctrl+- , Ctrl+B | Toggle line comments |
+| F9 | Build the project (`fz build`) |
+| F8 | Function focus — show one function at a time |
+| Ctrl+Space | Complete the word at the caret |
+| Ctrl+I | Inline help for the symbol at the caret |
+| Ctrl+E | Jump to the next problem |
+| Ctrl+W | Close buffer |
+| Tab / Shift+Tab | Indent / unindent line or selection |
+| Shift+arrows | Extend selection |
+| Ctrl+←/→ | Word jump |
+| Ctrl+Home / End | Start / end of buffer |
+| F10 / Alt+key | Open the menu bar |
+| F1 | Keyboard shortcut reference |
 
 ### `fz about`
 

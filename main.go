@@ -37,6 +37,8 @@ func main() {
 		err = runGfx(os.Args[2:])
 	case "map":
 		err = runMap(os.Args[2:])
+	case "edit":
+		err = runEdit(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:])
 	case "bgm":
@@ -75,6 +77,7 @@ func printUsage() {
 	fmt.Printf("  %s refresh [--yes]    Add missing template files; prompt to replace existing ones (--yes skips prompts)\n", bin)
 	fmt.Printf("  %s gfx [file]         Open sprite editor (file resolved under assets/gfx/)\n", bin)
 	fmt.Printf("  %s map [file]         Open map editor\n", bin)
+	fmt.Printf("  %s edit [file]        Open the Lua source editor (defaults to main.lua)\n", bin)
 	fmt.Printf("  %s bgm new <name>     Create bgm/<name>.html from BeepBox and open in browser\n", bin)
 	fmt.Printf("  %s bgm edit <name>    Open existing bgm/<name>.html in browser\n", bin)
 	fmt.Printf("  %s about             Show license and third-party attribution\n", bin)

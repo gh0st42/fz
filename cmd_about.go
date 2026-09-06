@@ -94,6 +94,21 @@ Copyright (c) bjornbytes
 https://github.com/bjornbytes/tick
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bundled fonts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+unscii-8  —  8x8 bitmap font  (fz edit, and shipped in new projects)
+Public domain
+Viznut and contributors
+http://viznut.fi/unscii/
+
+Flexi IBM VGA True  —  8x16 IBM VGA font  (fz edit)
+Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+Copyright (c) 2020 VileR
+https://int10h.org/oldschool-pc-fonts/
+http://creativecommons.org/licenses/by-sa/4.0/
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Bundled tools
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
