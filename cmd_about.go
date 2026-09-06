@@ -94,6 +94,15 @@ Copyright (c) bjornbytes
 https://github.com/bjornbytes/tick
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Sound synthesis
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+sfxr  —  the synthesiser and preset generators behind fz sfx
+MIT License
+Copyright (c) 2007 Tomas Pettersson (DrPetter)
+http://www.drpetter.se/project_sfxr.html
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Bundled fonts
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

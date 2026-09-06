@@ -10,7 +10,8 @@ Its features include amongst other things the following:
 - A project runner including auto-(re)launching after file changes (watch)
 - A tile-sheet editor (`fz gfx`)
 - A tile-map editor (`fz map`)
-- A Lua source editor (`fz edit`).
+- A Lua source editor (`fz edit`)
+- A sound-effect generator (`fz sfx`).
 
 ## Installation
 
@@ -466,6 +467,48 @@ With neither installed, `F7` says so and changes nothing; the override does noth
 | Ctrl+Home / End | Start / end of buffer |
 | F10 / Alt+key | Open the menu bar |
 | F1 | Keyboard shortcut reference |
+
+### `fz sfx [name]`
+
+Opens a sound-effect generator in the sfxr / bfxr / rFXGen line, on the same 640×480 canvas as the other editors. Run it from the project root; sounds live in `assets/sfx/`.
+
+```
+cd mygame
+fz sfx                  # start from the default tone
+fz sfx coin             # open assets/sfx/coin.json, or start a new sound called "coin"
+```
+
+The window is three columns: the sound's own controls on the left, the twenty-two parameter sliders in the middle, and a browser on the right listing the preset generators above the project's saved sounds — so a preset and a saved sound are equally one click from being tweaked. Above the browser, an oscilloscope plots the rendered sound, normalised to its own peak so the envelope shape is readable even at low volumes.
+
+**The synthesiser** is a port of DrPetter's original sfxr (2007, MIT) — the engine behind sfxr, bfxr, sfxr-qt and raylib's rFXGen. The parameter set and the arithmetic are faithful to it, including the 8× oversampling that keeps the square and sawtooth edges from aliasing, so a sound designed against any of those tools behaves the same here. Four waveforms: square, sawtooth, sine and noise.
+
+**Presets.** The eight generators sfxr shipped with — Pickup/Coin, Laser/Shoot, Explosion, Powerup, Hit/Hurt, Jump, Blip/Select and Randomize — each scatter a handful of parameters inside ranges chosen to land on a recognisable game sound. **Mutate** nudges about half the parameters slightly, which is how you walk from a sound you almost liked to one you did. Both are on the toolbar and on `R` / `M`.
+
+**Saving writes both files at once**, under the name in the left column: `assets/sfx/<name>.json` for the parameters and `assets/sfx/<name>.wav` for the audio. A sound is only useful to the game as audio and only editable again as parameters, so the two are never out of step. The WAV is 16-bit mono PCM at 44.1 kHz, and the preview you hear goes through the same encoder as the file on disk, so what you heard is what got written.
+
+**The JSON** is a plain, diffable parameter set with a `tool` and `version` marker:
+
+```json
+{
+  "tool": "fz sfx",
+  "version": 1,
+  "params": { "wave": 0, "attack": 0, "sustain": 0.05, "punch": 0.5, "decay": 0.3, "freq": 0.6, ... }
+}
+```
+
+A bare parameter object without the wrapper also loads, so a file trimmed by hand or written by a script still opens. Every value is clamped to its slider's range on load, so a hand-edited or foreign file cannot drive the synthesiser somewhere it will not come back from, and a render is capped at 30 seconds.
+
+| Key | Action |
+|---|---|
+| Space | Play the current sound |
+| R | Randomize |
+| M | Mutate |
+| ↑ / ↓ / Enter | Move through the browser and load the selection |
+| Ctrl+S | Save `.json` and `.wav` |
+| F5 | Rescan `assets/sfx` |
+| Esc | Quit |
+
+With **Auto play** ticked (the default) every change previews itself, including a slider drag. If no audio device is available the editor says so in the status bar and still renders and exports normally.
 
 ### `fz about`
 

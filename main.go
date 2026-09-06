@@ -41,6 +41,8 @@ func main() {
 		err = runEdit(os.Args[2:])
 	case "serve":
 		err = runServe(os.Args[2:])
+	case "sfx":
+		err = runSfx(os.Args[2:])
 	case "bgm":
 		err = runBgm(os.Args[2:])
 	case "about":
@@ -78,6 +80,7 @@ func printUsage() {
 	fmt.Printf("  %s gfx [file]         Open sprite editor (file resolved under assets/gfx/)\n", bin)
 	fmt.Printf("  %s map [file]         Open map editor\n", bin)
 	fmt.Printf("  %s edit [file]        Open the Lua source editor (defaults to main.lua)\n", bin)
+	fmt.Printf("  %s sfx [name]         Open the sound-effect generator (assets/sfx/<name>.json)\n", bin)
 	fmt.Printf("  %s bgm new <name>     Create bgm/<name>.html from BeepBox and open in browser\n", bin)
 	fmt.Printf("  %s bgm edit <name>    Open existing bgm/<name>.html in browser\n", bin)
 	fmt.Printf("  %s about             Show license and third-party attribution\n", bin)
