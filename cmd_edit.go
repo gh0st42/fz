@@ -135,7 +135,7 @@ func edRecalcLayout() {
 	edFrameH = virtualH - statusBarH - edFrameY - 2
 	edTextY0 = edFrameY + 1 + edLineH
 	edTextH = edFrameH - 2 - edLineH - edScrollW
-	edRows = int(edTextH / edTxtLineH)
+	edRows = int(edTextH / edLineH)
 	edHScrY = edFrameY + edFrameH - 1 - edScrollW
 	edStatusTextY = max((statusBarH-edLineH)/2, 0)
 }
@@ -147,8 +147,16 @@ func edRecalcLayout() {
 // fall back to raylib's built-in font and widen the cell enough that its
 // variable-width glyphs still line up.
 
-//go:embed 3pp/fonts/Flexi_IBM_VGA_True.ttf
+// Both faces live in 3pp/ because they are part of the Go binary. The copy of
+// unscii under templates/ is a different thing: that one is shipped into new
+// projects for the game to load at runtime, and is free to change without the
+// editor caring.
+
+//go:embed 3pp/fonts/Perfect_DOS_VGA_437.ttf
 var vgaFontTTF []byte
+
+//go:embed 3pp/fonts/unscii-8.ttf
+var unsciiFontTTF []byte
 
 type edFontKind int
 
@@ -157,77 +165,46 @@ const (
 	edFontVGA
 )
 
-// edFontStep is one entry on a face's size ladder: the raylib font size, the
-// character cell it fills, and where the glyph sits inside that cell.
-type edFontStep struct {
+// edFontDef is a face and the fixed character cell it renders in: the raylib
+// font size, the row pitch, and where the glyph sits inside the cell.
+type edFontDef struct {
+	label   string
 	size    int32
 	lineH   int32
 	glyphDY int32
 }
 
-type edFontDef struct {
-	label string
-	steps []edFontStep // ascending
-	def   int          // index of the default step, also used for the chrome
-}
-
-// Both faces end up 8 px wide at zoom 1; unscii-8 is an 8x8 cell, the IBM VGA
-// face an 8x16 one, which is what gives the latter a true 80x25 DOS window.
+// Each face gets the one size that lands on the pixel grid, and only that size.
+// raylib scales a face by its ascent-descent, so what a given size yields is a
+// property of the font's em, and the two faces answer differently.
 //
-// The base sizes are not the cell heights. raylib scales a face by
-// ascent-descent, and the VGA font declares a 1600-unit em around a character
-// cell that is only 675x1350 units, so asking for 16 renders the cell at
-// 6.75x13.5 px - every stem on a half pixel. 19 is the size at which its
-// advance comes out at exactly 8 px and its ink at exactly 16.
+// unscii-8 puts an 8x8 cell on a square em, so size 8 is its native cell; the
+// 12px pitch adds leading. Perfect DOS VGA 437 puts the 9x16 cell of real IBM
+// VGA text mode on a 4096-unit em with exactly 256 units to the design pixel,
+// so at size 16 one design pixel is one screen pixel: the advance comes out at
+// exactly 9 and the ink at exactly 16, with every stem landing whole.
 //
-// Zoom steps multiply the base size, because a pixel face only stays even at
-// whole multiples: 1.5x would draw some stems one pixel wide and others two.
-// The cells are design values, not measurements: both faces draw ink outside
-// their character cell (unscii's descenders fill all 8 rows, and the VGA face's
-// '$' overshoots its 16-row cell into the em's padding), so measuring the ink
-// extent would give 19 rows for what is an 8x16 font.
+// Any other size rounds the advance and shaves a fraction off the stems, which
+// leaves the glyphs unevenly weighted however hard-edged the atlas is - so the
+// editor does not offer them, and there is no font zoom.
 //
-// unscii-8 is an 8px bitmap face, so it only has its native size and a clean
-// double. The VGA face is an outline approximation of an 8x16 cell on a
-// 1600-unit em, and rasterises unevenly wherever a design pixel does not land
-// near a whole screen pixel - at 19 (its nominal 8x16) some stems come out two
-// pixels wide and others one. 16 and 18 land better; the ladder keeps 19 for
-// the authentic 80x25 window and offers the cleaner sizes either side.
+// The cell heights are design values, not measurements. Both faces draw ink
+// outside their character cell - unscii's box-drawing glyphs fill the whole em
+// - so measuring the ink extent would report about twice the rows the text
+// actually needs.
 var edFontDefs = [...]edFontDef{
-	edFontUnscii: {"unscii-8", []edFontStep{
-		{8, 12, 2},
-		{16, 24, 4},
-	}, 0},
-	edFontVGA: {"IBM VGA", []edFontStep{
-		{10, 8, -1},
-		{12, 10, -2},
-		{16, 14, -1},
-		{18, 15, -2},
-		{19, 16, -2},
-		{24, 20, -3},
-		{38, 32, -4},
-	}, 2},
+	edFontUnscii: {"unscii-8", 8, 12, 2},
+	edFontVGA:    {"DOS VGA", 16, 16, 0},
 }
 
-// The chrome - menu bar, frame, dialogs, status bar - always renders at the
-// face's base size, so zooming the source text does not push the menu bar off
-// the 640px canvas. Only the text area follows the size ladder.
 var (
-	edFont        rl.Font        // chrome
-	edFontGlyphs  []rl.GlyphInfo // backing store for edFont; freed on switch
-	edFontLoaded  bool
-	edFontKindID  = edFontUnscii
-	edFontStepIdx int
-	edFontSize    = float32(10)
-	edCharW       = int32(8)
-	edGlyphDY     = int32(1) // vertical placement of a glyph inside its cell
-
-	edTxtFont    rl.Font // source text
-	edTxtGlyphs  []rl.GlyphInfo
-	edTxtSize    = float32(10)
-	edTxtCharW   = int32(8)
-	edTxtLineH   = int32(12)
-	edTxtGlyphDY = int32(1)
+	edFont       rl.Font        // the one face, chrome and source text alike
+	edFontGlyphs []rl.GlyphInfo // backing store for edFont; freed on switch
+	edFontLoaded bool
+	edFontKindID = edFontUnscii
+	edFontSize   = float32(10)
+	edCharW      = int32(8)
+	edGlyphDY    = int32(1) // vertical placement of a glyph inside its cell
 )
 
 // edFontData returns the embedded TTF for a face.
@@ -235,11 +212,7 @@ func edFontData(kind edFontKind) []byte {
 	if kind == edFontVGA {
 		return vgaFontTTF
 	}
-	data, err := templatesFS.ReadFile("templates/assets/fonts/unscii-8.ttf")
-	if err != nil {
-		return nil
-	}
-	return data
+	return unsciiFontTTF
 }
 
 // edFontCodepoints is the glyph set the atlas is built from. Passing nil here
@@ -296,86 +269,28 @@ func edBuildFont(data []byte, size int32) (rl.Font, []rl.GlyphInfo) {
 // edSetFont switches the editor face, re-deriving the character cell, the
 // window layout and the raygui style from it. It reports whether the requested
 // face loaded; on failure the previous font is kept.
-func edSetFont(kind edFontKind, step int) bool {
-	def := edFontDefs[kind]
-	if step < 0 || step >= len(def.steps) {
-		return false
-	}
+func edSetFont(kind edFontKind) bool {
 	data := edFontData(kind)
 	if data == nil {
 		return false
 	}
-
-	// The chrome always renders at the face's default step, so changing the
-	// text size never pushes the menu bar off the canvas.
-	chrome, txtStep := def.steps[def.def], def.steps[step]
-	ui, uiGlyphs := edBuildFont(data, chrome.size)
-	if uiGlyphs == nil {
+	def := edFontDefs[kind]
+	f, glyphs := edBuildFont(data, def.size)
+	if glyphs == nil {
 		return false
-	}
-	txt, txtGlyphs := ui, uiGlyphs
-	if step != def.def {
-		if txt, txtGlyphs = edBuildFont(data, txtStep.size); txtGlyphs == nil {
-			rl.UnloadTexture(ui.Texture)
-			rl.UnloadFontData(uiGlyphs)
-			return false
-		}
 	}
 
 	edUnloadFont()
-	edFont, edFontGlyphs, edFontLoaded = ui, uiGlyphs, true
-	edTxtFont, edTxtGlyphs = txt, txtGlyphs
-	edFontKindID, edFontStepIdx = kind, step
+	edFont, edFontGlyphs, edFontLoaded = f, glyphs, true
+	edFontKindID = kind
 
-	edFontSize = float32(chrome.size)
-	edCharW = edMeasureCharW(ui, edFontSize, 0)
-	edLineH, edGlyphDY = chrome.lineH, chrome.glyphDY
-
-	edTxtSize = float32(txtStep.size)
-	edTxtCharW = edMeasureCharW(txt, edTxtSize, 0)
-	edTxtLineH, edTxtGlyphDY = txtStep.lineH, txtStep.glyphDY
+	edFontSize = float32(def.size)
+	edCharW = edMeasureCharW(f, edFontSize, 0)
+	edLineH, edGlyphDY = def.lineH, def.glyphDY
 
 	edRecalcLayout()
 	edApplyGuiStyle()
 	return true
-}
-
-// edLayoutUsable reports whether the current cell still leaves a workable text
-// area. Used to refuse a zoom step rather than render an unusable window.
-func edLayoutUsable() bool {
-	const minRows, minCols = 8, 24
-	cols := (edVScrX - edFrameX - 1 - edPad - 5*edTxtCharW) / edTxtCharW // widest gutter
-	return edRows >= minRows && cols >= minCols
-}
-
-// edApplyFontZoom walks the active face's size ladder, reverting when a step
-// would leave too little room to edit in.
-func edApplyFontZoom(s *edState, delta int) {
-	prev := edFontStepIdx
-	want := prev + delta
-	if want < 0 || want >= len(edFontDefs[edFontKindID].steps) {
-		s.toast.Notify(edEdgeOfLadder(delta))
-		return
-	}
-	if !edSetFont(edFontKindID, want) {
-		s.toast.Notify("Could not load that size")
-		return
-	}
-	if !edLayoutUsable() {
-		edSetFont(edFontKindID, prev)
-		s.toast.Notify(edEdgeOfLadder(delta))
-		return
-	}
-	s.ensureVisible()
-	s.toast.Notify(fmt.Sprintf("%dpx - %dx%d cell, %d cols x %d rows",
-		int(edTxtSize), edTxtCharW, edTxtLineH, edCols(s), edRows))
-}
-
-func edEdgeOfLadder(delta int) string {
-	if delta < 0 {
-		return "Already at the smallest size"
-	}
-	return "Already at the largest size"
 }
 
 // edUnloadFont releases the active face, if it is one of ours.
@@ -383,9 +298,9 @@ func edUnloadFont() {
 	if !edFontLoaded {
 		return
 	}
-	if edTxtFont.Texture.ID != edFont.Texture.ID {
-		rl.UnloadTexture(edTxtFont.Texture)
-		rl.UnloadFontData(edTxtGlyphs)
+	if edFont.Texture.ID != edFont.Texture.ID {
+		rl.UnloadTexture(edFont.Texture)
+		rl.UnloadFontData(edFontGlyphs)
 	}
 	rl.UnloadTexture(edFont.Texture)
 	rl.UnloadFontData(edFontGlyphs)
@@ -395,7 +310,7 @@ func edUnloadFont() {
 // edInitFont installs the default face, falling back to raylib's built-in font
 // when neither embedded face can be loaded.
 func edInitFont() {
-	if edSetFont(edFontUnscii, edFontDefs[edFontUnscii].def) {
+	if edSetFont(edFontUnscii) {
 		return
 	}
 	edFont = rl.GetFontDefault()
@@ -404,8 +319,6 @@ func edInitFont() {
 	edLineH = 12
 	edCharW = edMeasureCharW(edFont, edFontSize, 1)
 	edGlyphDY = 1
-	edTxtFont, edTxtSize, edTxtLineH = edFont, edFontSize, edLineH
-	edTxtCharW, edTxtGlyphDY = edCharW, edGlyphDY
 	edRecalcLayout()
 	edApplyGuiStyle()
 }
@@ -437,17 +350,17 @@ func edGutterW(s *edState) int32 {
 	if !s.showLineNums {
 		return 0
 	}
-	return 5 * edTxtCharW // 4 digits + separating space
+	return 5 * edCharW // 4 digits + separating space
 }
 
 func edTextX0(s *edState) int32 { return edFrameX + 1 + edPad + edGutterW(s) }
 
 func edCols(s *edState) int {
 	w := edVScrX - edTextX0(s) - edPad
-	if w < edTxtCharW {
+	if w < edCharW {
 		return 1
 	}
-	return int(w / edTxtCharW)
+	return int(w / edCharW)
 }
 
 // ── state ─────────────────────────────────────────────────────────────────────
@@ -493,12 +406,21 @@ const (
 	edActNextProblem
 	edActFontUnscii
 	edActFontVGA
-	edActFontBigger
-	edActFontSmaller
 	edActFormat
 	edActBuild
-	edActGfx
-	edActMap
+	edActTools
+
+	// One action per Ctrl+1..9 slot. These must stay contiguous and last in
+	// the block: edRunTool indexes off edActTool1.
+	edActTool1
+	edActTool2
+	edActTool3
+	edActTool4
+	edActTool5
+	edActTool6
+	edActTool7
+	edActTool8
+	edActTool9
 	edActNextBuf
 	edActPrevBuf
 	edActCloseBuf
@@ -518,6 +440,8 @@ const (
 	edDlgFind
 	edDlgReplace
 	edDlgGoto
+	edDlgTools
+	edDlgToolAdd
 )
 
 type edSnapshot struct {
@@ -751,10 +675,8 @@ var edMenus = []edMenu{
 		{"", "", edActNone},
 		{"Build", "F9", edActBuild},
 	}},
-	{"Tools", []edMenuItem{
-		{"Sprite Editor", "", edActGfx},
-		{"Map Editor", "", edActMap},
-	}},
+	// Filled in by edRebuildToolsMenu; see cmd_edit_tools.go.
+	{"Tools", nil},
 	{"Window", []edMenuItem{
 		{"Next", "F6", edActNextBuf},
 		{"Previous", "A-F6", edActPrevBuf},
@@ -771,10 +693,7 @@ var edMenus = []edMenu{
 		{"Indent Width", "", edActIndentWidth},
 		{"", "", edActNone},
 		{"Font: unscii-8", "", edActFontUnscii},
-		{"Font: IBM VGA", "", edActFontVGA},
-		{"", "", edActNone},
-		{"Larger Font", "A-+", edActFontBigger},
-		{"Smaller Font", "A--", edActFontSmaller},
+		{"Font: DOS VGA", "", edActFontVGA},
 	}},
 	{"Help", []edMenuItem{
 		{"Keys", "F1", edActHelp},
@@ -1528,6 +1447,15 @@ func runEdit(args []string) error {
 	}
 	path := edResolvePath(name)
 
+	// Started with no file, the editor opens the project's main.lua. Naming a
+	// file that does not exist still creates it, but with nothing named and no
+	// main.lua there is no project here to edit, and opening an empty window
+	// would only hide that.
+	if name == "" && !fileExists(path) {
+		return fmt.Errorf("no %s in this directory\n"+
+			"Run 'fz init' to set up a project here, or 'fz new <name>' to create one", path)
+	}
+
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagWindowHighdpi)
 	rl.InitWindow(virtualW*2, virtualH*2, "fz edit — "+filepath.Base(path))
 	fixRetinaStartupScale()
@@ -1536,6 +1464,8 @@ func runEdit(args []string) error {
 
 	edInitFont()
 	defer edUnloadFont()
+
+	edLoadTools()
 
 	s := &edState{
 		path:         path,
@@ -1704,6 +1634,12 @@ func edGuardDirty(s *edState, act edAction, dirty bool, msg string) bool {
 }
 
 func edApply(s *edState, act edAction) {
+	// The tool slots are a contiguous range rather than nine cases.
+	if act >= edActTool1 && act <= edActTool9 {
+		edRunTool(s, int(act-edActTool1))
+		return
+	}
+
 	switch act {
 	case edActNew:
 		edOpenBuffer(s, edUntitledName(s), []string{""})
@@ -1821,11 +1757,8 @@ func edApply(s *edState, act edAction) {
 	case edActBuild:
 		edStartBuild(s)
 
-	case edActGfx:
-		edSpawnTool(s, "sprite editor", "gfx")
-
-	case edActMap:
-		edSpawnTool(s, "map editor", "map")
+	case edActTools:
+		edShowToolsDialog(s)
 
 	case edActFind:
 		s.dlgInput = s.findTerm
@@ -1878,12 +1811,6 @@ func edApply(s *edState, act edAction) {
 
 	case edActFontVGA:
 		edSwitchFont(s, edFontVGA)
-
-	case edActFontBigger:
-		edApplyFontZoom(s, 1)
-
-	case edActFontSmaller:
-		edApplyFontZoom(s, -1)
 
 	case edActComplete:
 		edStartComplete(s)
@@ -1997,12 +1924,13 @@ func edToggleForceStylua(s *edState) {
 	s.toast.Notify("Formatting with " + edPickFormatter().name)
 }
 
-// edSwitchFont changes the typeface, keeping each face's own default size.
+// edSwitchFont changes the typeface. Each face has one fixed size, so this
+// also re-flows the window around the new character cell.
 func edSwitchFont(s *edState, kind edFontKind) {
 	if edFontKindID == kind {
 		return
 	}
-	if !edSetFont(kind, edFontDefs[kind].def) {
+	if !edSetFont(kind) {
 		s.toast.Notify("Could not load that font")
 		return
 	}
@@ -2333,6 +2261,17 @@ var edCtrlKeyMap = []edKeyBinding{
 	{rl.KeySpace, edActComplete},
 	{rl.KeyI, edActInlineHelp},
 
+	// Ctrl+1..9 run the Tools menu in order, from the number row or the keypad.
+	{rl.KeyOne, edActTool1}, {rl.KeyKp1, edActTool1},
+	{rl.KeyTwo, edActTool2}, {rl.KeyKp2, edActTool2},
+	{rl.KeyThree, edActTool3}, {rl.KeyKp3, edActTool3},
+	{rl.KeyFour, edActTool4}, {rl.KeyKp4, edActTool4},
+	{rl.KeyFive, edActTool5}, {rl.KeyKp5, edActTool5},
+	{rl.KeySix, edActTool6}, {rl.KeyKp6, edActTool6},
+	{rl.KeySeven, edActTool7}, {rl.KeyKp7, edActTool7},
+	{rl.KeyEight, edActTool8}, {rl.KeyKp8, edActTool8},
+	{rl.KeyNine, edActTool9}, {rl.KeyKp9, edActTool9},
+
 	// Which physical key yields "/" or "-" depends on the keyboard layout, so
 	// comment toggling answers to all of them.
 	{rl.KeySlash, edActToggleComment},
@@ -2402,14 +2341,6 @@ func edModalInput(s *edState) bool {
 }
 
 func edAltKeys(s *edState) bool {
-	switch {
-	case s.repeatKey(rl.KeyEqual) || s.repeatKey(rl.KeyKpAdd):
-		edApply(s, edActFontBigger)
-		return true
-	case s.repeatKey(rl.KeyMinus) || s.repeatKey(rl.KeyKpSubtract):
-		edApply(s, edActFontSmaller)
-		return true
-	}
 	switch {
 	case s.repeatKey(rl.KeyUp):
 		edApply(s, edActMoveUp)
@@ -2642,7 +2573,7 @@ func edTextRect(s *edState) rl.Rectangle {
 
 // edPosFromMouse maps a canvas position to a (column, line) caret position.
 func edPosFromMouse(s *edState, p rl.Vector2) (int, int) {
-	row := int((p.Y - float32(edTextY0)) / float32(edTxtLineH))
+	row := int((p.Y - float32(edTextY0)) / float32(edLineH))
 	if p.Y < float32(edTextY0) {
 		row = 0
 	}
@@ -2650,7 +2581,7 @@ func edPosFromMouse(s *edState, p rl.Vector2) (int, int) {
 
 	col := 0
 	if dx := p.X - float32(edTextX0(s)); dx > 0 {
-		col = int((dx + float32(edTxtCharW)/2) / float32(edTxtCharW))
+		col = int((dx + float32(edCharW)/2) / float32(edCharW))
 	}
 	x := max(0, min(s.scrollX+col, s.lineLen(y)))
 	return x, y
@@ -2723,17 +2654,31 @@ func (s *edState) openDialog(kind edDialogKind) {
 
 // edListDialog reports whether a dialog kind is one of the list pickers.
 func edListDialog(d edDialogKind) bool {
-	return d == edDlgOpen || d == edDlgOutline || d == edDlgBuffers
+	return d == edDlgOpen || d == edDlgOutline || d == edDlgBuffers || d == edDlgTools
 }
 
 func edDialogInput(s *edState) {
 	if rl.IsKeyPressed(rl.KeyEscape) {
+		if s.dlg == edDlgToolAdd {
+			s.openDialog(edDlgTools) // step back to the list, not out of both
+			return
+		}
 		s.dlg = edDlgNone
 		return
 	}
 	if s.dlg == edDlgReplace && rl.IsKeyPressed(rl.KeyTab) {
 		s.dlgField = 1 - s.dlgField
 		return
+	}
+	if s.dlg == edDlgTools {
+		switch {
+		case rl.IsKeyPressed(rl.KeyInsert):
+			edToolsAdd(s)
+			return
+		case rl.IsKeyPressed(rl.KeyDelete):
+			edToolsRemove(s)
+			return
+		}
 	}
 	if edListDialog(s.dlg) {
 		switch {
@@ -2836,6 +2781,14 @@ func edDialogConfirm(s *edState) {
 		s.hasSel = false
 		s.refocus()
 		s.ensureVisible()
+
+	case edDlgTools:
+		edRunTool(s, int(s.dlgActive))
+
+	case edDlgToolAdd:
+		// Reopens the tool list on success, so several can be added in a row.
+		edToolsAddConfirm(s)
+		return
 	}
 	s.dlg = edDlgNone
 }
@@ -2868,7 +2821,7 @@ func edDrawHelp(s *edState) {
 		{},
 		{"F8", "Function focus"},
 		{"F9", "Build the project"},
-		{"Alt+ / Alt-", "Text size"},
+		{"^1 ... ^9", "Run tool 1-9"},
 	}
 	right := []row{
 		{"^F", "Find"},

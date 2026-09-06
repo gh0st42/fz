@@ -329,7 +329,7 @@ func edCaretScreen(s *edState) (x, y int32, ok bool) {
 	if row < 0 || row >= edRows || col < 0 || col > edCols(s) {
 		return 0, 0, false
 	}
-	return edTextX0(s) + int32(col)*edTxtCharW, edTextY0 + int32(row)*edTxtLineH, true
+	return edTextX0(s) + int32(col)*edCharW, edTextY0 + int32(row)*edLineH, true
 }
 
 // edPanelRect places a popup of the given size near the caret, flipping it
@@ -337,7 +337,7 @@ func edCaretScreen(s *edState) (x, y int32, ok bool) {
 func edPanelRect(caretX, caretY, w, h int32) (int32, int32) {
 	x := min(caretX, edVScrX-w-2)
 	x = max(x, edFrameX+2)
-	y := caretY + edTxtLineH
+	y := caretY + edLineH
 	if y+h > edFrameY+edFrameH-edScrollW {
 		y = caretY - h
 	}
@@ -447,7 +447,7 @@ func edDrawSignature(s *edState) {
 	x := max(edFrameX+2, min(caretX, edVScrX-w-2))
 	y := caretY - edLineH - 2
 	if y < edTextY0 {
-		y = caretY + edTxtLineH + 2
+		y = caretY + edLineH + 2
 	}
 
 	rl.DrawRectangle(x, y, w, edLineH, edEgaLightGray)
@@ -650,7 +650,7 @@ func edDrawDiagnosticMarks(s *edState, line int, y int32) {
 	if to <= from {
 		return
 	}
-	x := edTextX0(s) + int32(from-s.scrollX)*edTxtCharW
-	w := int32(to-from) * edTxtCharW
-	rl.DrawRectangle(x, y+edTxtLineH-1, w, 1, edDiagnosticColor(d))
+	x := edTextX0(s) + int32(from-s.scrollX)*edCharW
+	w := int32(to-from) * edCharW
+	rl.DrawRectangle(x, y+edLineH-1, w, 1, edDiagnosticColor(d))
 }

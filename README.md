@@ -340,27 +340,34 @@ Opens a Lua source editor built on the same virtual 640×480 canvas and raygui w
 
 ```
 cd mygame
-fz edit                 # opens main.lua
+fz edit                 # opens the project's main.lua
 fz edit conf            # .lua is appended automatically
 fz edit retrolib        # bare names fall back to lib/retrolib.lua
+fz edit newthing        # a name that does not exist yet starts a new file
+```
+
+With no argument and no `main.lua` in the current directory there is no project to edit, so the editor says so and exits rather than opening on an empty buffer:
+
+```
+$ fz edit
+error: no main.lua in this directory
+Run 'fz init' to set up a project here, or 'fz new <name>' to create one
 ```
 
 Lua syntax highlighting covers keywords, standard-library and Love2D globals, strings (including `[[long]]` brackets), numbers and comments. Text is drawn on a fixed character grid with the bundled unscii-8 bitmap font.
 
 `Alt+F2` opens an outline of the file: every `function f()`, `local function f()`, `function M.f()` / `M:f()` and `f = function()` declaration, sorted by name and shown with its line number. Only the bare name is listed; scope shows in the colour instead — yellow for top-level functions visible to the whole project, cyan for top-level `local` ones, grey for functions declared inside another function, and white for the `(top of file)` entry. A nested one also names the top-level function it belongs to in its own column, however deeply it is nested. Declarations inside comments or long strings are skipped. The list always starts with a `(top of file)` entry, so it is never empty and there is always a jump back to line 1. The function around the cursor is preselected, and Enter (or **Go To**) jumps to it.
 
-**Fonts.** Two faces are embedded and switchable from the **Options** menu, each with its own ladder of sizes stepped by `Alt` `+` / `Alt` `-`:
+**Fonts.** Two faces are embedded and switchable from the **Options** menu. Each renders at one fixed size — the one where it lands on the pixel grid — and there is no font zoom:
 
-| Font | Sizes (cell) | Window at the default |
+| Font | Cell | Window |
 |---|---|---|
-| unscii-8 (default) | 8 (8×12), 16 (16×24) | 72×34 |
-| IBM VGA | 10 (4×8), 12 (5×10), **16 (6×14)**, 18 (7×15), 19 (8×16), 24 (10×20), 38 (16×32) | 98×29 |
+| unscii-8 (default) | 8×12 | 72×34 |
+| DOS VGA | 9×16 | 63×25 |
 
-Only the text scales: the menu bar, frame, dialogs and status bar stay at the face's default size, so the chrome keeps fitting the 640×480 canvas. A step that would leave fewer than 8 rows or 24 columns is refused.
+raylib scales a face by its ascent-descent, so what a given size yields is a property of the font's em. unscii-8 puts an 8×8 cell on a square em, so size 8 is its native cell and the 12px pitch just adds leading. Perfect DOS VGA 437 puts the 9×16 cell of real IBM VGA text mode on a 4096-unit em with exactly 256 units to the design pixel, so at size 16 one design pixel is one screen pixel: the advance comes out at exactly 9 and the ink at exactly 16, with every stem landing whole. Any other size rounds the advance and shaves a fraction off the stems, leaving the glyphs unevenly weighted however hard-edged the atlas is — which is why neither face is offered at any other size.
 
-unscii-8 is an 8px bitmap face, so it has only its native size and a clean double. The VGA face is an outline approximation of an 8×16 cell drawn on a 1600-unit em, and rasterises unevenly wherever a design pixel does not land near a whole screen pixel — at 19, its nominal 8×16, some stems come out two pixels wide and others one. It therefore defaults to 16, which lands more evenly; step up twice for the authentic 8×16 cell and its 72×25 DOS window, or down for a denser view.
-
-The atlas covers ASCII, Latin-1 and Latin Extended-A plus common punctuation and the euro sign, so umlauts and accented text render rather than turning into `?` — both faces carry the glyphs. The window is laid out from the character cell, so it re-flows when you switch face or size. Neither choice is persisted. Both faces are rasterised with raylib's `FONT_BITMAP` mode, which thresholds glyph coverage instead of anti-aliasing it, so the pixels stay hard-edged.
+The atlas covers ASCII, Latin-1 and Latin Extended-A plus common punctuation and the euro sign, so umlauts and accented text render rather than turning into `?`. unscii-8 covers all of it; the DOS VGA face is a code page 437 font, so it has the umlauts and the rest of the accented characters DOS knew, but Latin Extended-A and the typographic punctuation fall back to `?`. The window is laid out from the character cell, so it re-flows when you switch face. The choice is not persisted. Both faces are rasterised with raylib's `FONT_BITMAP` mode, which thresholds glyph coverage instead of anti-aliasing it, so the pixels stay hard-edged.
 
 **Code assistance.** With `lua-language-server` on PATH the editor talks to it for four things: symbol bounds (above), completion, inline help and signature hints.
 
@@ -384,7 +391,23 @@ Bounds come from a Lua block scanner that counts `function` / `if` / `do` agains
 
 One caveat worth knowing: love block-buffers its output when it is going to a pipe rather than a terminal, so nothing arrives while the crashed game is still on screen — the editor jumps to the fault the moment you close it. The game's output still reaches your terminal as before, and both streams are read, because love is not consistent about which one an error goes to.
 
-**Project and tools.** The **Project** menu runs the game (`F5`, same as `fz run`) and builds it (`F9`), calling `fz`'s own build straight from the editor — the archive is written on a background goroutine so the window keeps responding, and the result is reported in the status toast. The **Tools** menu opens the sprite (`fz gfx`) and map (`fz map`) editors; raylib allows one window per process, so each opens as its own `fz` process in the same working directory.
+**Project and tools.** The **Project** menu runs the game (`F5`, same as `fz run`) and builds it (`F9`), calling `fz`'s own build straight from the editor — the archive is written on a background goroutine so the window keeps responding, and the result is reported in the status toast.
+
+The **Tools** menu is nine slots bound to `Ctrl+1` … `Ctrl+9`. The first two are the sprite (`fz gfx`) and map (`fz map`) editors, which ship with fz and cannot be changed or removed; raylib allows one window per process, so each opens as its own `fz` process in the same working directory. The remaining slots are yours.
+
+**Tools → Configure...** lists every slot with its shortcut, built-in ones dimmed. `Insert` or **Add** appends a tool, `Delete` or **Remove** drops the selected one, and `Enter` or **Run** launches it. Add takes a command line, optionally named:
+
+```
+Lint = luacheck %f
+stylua %f
+git diff
+```
+
+Without a `Name =` prefix the command's first word names the tool. Four placeholders are substituted at launch: `%f` the file being edited, `%d` its directory, `%l` the cursor's line, and `%%` a literal percent. Commands run through the shell (`sh -c`, or `cmd /c` on Windows), so pipes, globs and variables work as they would at a prompt, and they run detached with their output going to the terminal the editor was started from — the editor does not wait for them.
+
+Nine is the whole list rather than a page size: a tool past `Ctrl+9` would be a menu entry no shortcut could reach. Removing a tool shifts the ones below it up, so their shortcuts change with them.
+
+Your tools are stored per project in `.fz/tools.json`, next to the game rather than in your home directory, because the commands worth binding are usually the project's own — so they survive restarts and can be committed with it. Only your tools are written; the built-ins come from the binary. A missing or malformed file is not an error, and the editor just starts with the two built-ins.
 
 **Search and replace.** `Ctrl+F` finds, `F4` repeats, and `Ctrl+H` replaces. The replace dialog has both fields at once — `Tab` or a click moves between them — with **Replace** for the highlighted match, **All** for every match, and `Enter` as a shortcut for Replace so you can walk a file without touching the mouse. Matching is case-insensitive like Find, replacements go in literally, and everything is confined to what the view currently shows, so a replace-all inside function focus cannot reach past the function on screen or rewrite its sealed declaration. Opening the dialog with a selection spanning several lines scopes **All** to those lines, which the title says. A replace-all is one undo step; one that matches nothing leaves no undo step at all.
 

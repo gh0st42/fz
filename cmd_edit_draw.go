@@ -11,9 +11,9 @@ import (
 
 // ── drawing ───────────────────────────────────────────────────────────────────
 //
-// Everything is laid out on the character grid: edDrawChar and edDrawStr put a
-// glyph in a cell of the chrome font, edDrawTxtChar and edDrawTxtStr do the
-// same in the zoomable source-text face. See the font section in cmd_edit.go.
+// Everything is laid out on the character grid: edDrawChar puts a glyph in one
+// cell and edDrawStr lays a string across consecutive cells. The chrome and the
+// source text share a face. See the font section in cmd_edit.go.
 
 // edDrawChar draws one glyph centred in the grid cell whose top-left is (x,y).
 // Blanks are skipped so the caller's background shows through.
@@ -29,20 +29,6 @@ func edDrawChar(x, y int32, r rune, col rl.Color) {
 func edDrawStr(x, y int32, text string, col rl.Color) {
 	for i, r := range []rune(text) {
 		edDrawChar(x+int32(i)*edCharW, y, r, col)
-	}
-}
-
-// edDrawTxtChar and edDrawTxtStr are the same, in the source-text face.
-func edDrawTxtChar(x, y int32, r rune, col rl.Color) {
-	if r == ' ' || r == '\t' {
-		return
-	}
-	rl.DrawTextCodepoint(edTxtFont, r, rl.NewVector2(float32(x), float32(y+edTxtGlyphDY)), edTxtSize, col)
-}
-
-func edDrawTxtStr(x, y int32, text string, col rl.Color) {
-	for i, r := range []rune(text) {
-		edDrawTxtChar(x+int32(i)*edTxtCharW, y, r, col)
 	}
 }
 
@@ -155,19 +141,19 @@ func edDrawText(s *edState) {
 		if ln > bottom {
 			break
 		}
-		y := edTextY0 + int32(row)*edTxtLineH
+		y := edTextY0 + int32(row)*edLineH
 
 		if s.showLineNums {
 			num := edEgaDarkGray
 			if d, ok := edDiagnosticAt(s, ln); ok {
 				num = edDiagnosticColor(d)
 			}
-			edDrawTxtStr(edFrameX+1+edPad, y, fmt.Sprintf("%4d", ln+1), num)
+			edDrawStr(edFrameX+1+edPad, y, fmt.Sprintf("%4d", ln+1), num)
 		}
 		edDrawDiagnosticMarks(s, ln, y)
 
 		if s.focus.sealed(ln) {
-			rl.DrawRectangle(x0, y, edVScrX-x0-edPad, edTxtLineH, edClrSealed)
+			rl.DrawRectangle(x0, y, edVScrX-x0-edPad, edLineH, edClrSealed)
 		}
 		if row < len(guides) {
 			edDrawGuides(s, guides[row], x0, y)
@@ -182,10 +168,10 @@ func edDrawText(s *edState) {
 
 		for c := 0; c < cols; c++ {
 			idx := s.scrollX + c
-			cx := x0 + int32(c)*edTxtCharW
+			cx := x0 + int32(c)*edCharW
 			selected := idx >= selFrom && idx < selTo
 			if selected {
-				rl.DrawRectangle(cx, y, edTxtCharW, edTxtLineH, edEgaLightGray)
+				rl.DrawRectangle(cx, y, edCharW, edLineH, edEgaLightGray)
 			}
 			if idx >= len(runes) {
 				continue
@@ -197,7 +183,7 @@ func edDrawText(s *edState) {
 			if selected {
 				col = edEgaBlack
 			}
-			edDrawTxtChar(cx, y, runes[idx], col)
+			edDrawChar(cx, y, runes[idx], col)
 		}
 	}
 
@@ -211,11 +197,11 @@ func edDrawGuides(s *edState, indent int, x0, y int32) {
 		if col < s.scrollX {
 			continue
 		}
-		x := x0 + int32(col-s.scrollX)*edTxtCharW
+		x := x0 + int32(col-s.scrollX)*edCharW
 		if x >= edVScrX-edPad {
 			break
 		}
-		rl.DrawRectangle(x, y, 1, edTxtLineH, edClrGuide)
+		rl.DrawRectangle(x, y, 1, edLineH, edClrGuide)
 	}
 }
 
@@ -244,9 +230,9 @@ func edOutlineSpan(s *edState, span edBlockSpan) {
 	if to <= from {
 		return
 	}
-	x := edTextX0(s) + int32(from-s.scrollX)*edTxtCharW
-	y := edTextY0 + int32(row)*edTxtLineH
-	rl.DrawRectangleLines(x-1, y, int32(to-from)*edTxtCharW+2, edTxtLineH, edClrMatch)
+	x := edTextX0(s) + int32(from-s.scrollX)*edCharW
+	y := edTextY0 + int32(row)*edLineH
+	rl.DrawRectangleLines(x-1, y, int32(to-from)*edCharW+2, edLineH, edClrMatch)
 }
 
 func edDrawCursor(s *edState) {
@@ -261,11 +247,11 @@ func edDrawCursor(s *edState) {
 	if row < 0 || row >= edRows || col < 0 || col >= edCols(s) {
 		return
 	}
-	x := edTextX0(s) + int32(col)*edTxtCharW
-	y := edTextY0 + int32(row)*edTxtLineH
-	rl.DrawRectangle(x, y, edTxtCharW, edTxtLineH, edEgaWhite)
+	x := edTextX0(s) + int32(col)*edCharW
+	y := edTextY0 + int32(row)*edLineH
+	rl.DrawRectangle(x, y, edCharW, edLineH, edEgaWhite)
 	if r := s.runes(s.cy); s.cx < len(r) {
-		edDrawTxtChar(x, y, r[s.cx], edEgaBlue)
+		edDrawChar(x, y, r[s.cx], edEgaBlue)
 	}
 }
 
@@ -573,6 +559,44 @@ func edDrawDialog(s *edState) {
 	}
 
 	switch s.dlg {
+	case edDlgTools:
+		_, _, w, h := edListDlgRect()
+		x, y := edDialogFrame("Tools - Ctrl+1 to Ctrl+9", w, h)
+
+		// The built-in tools are dimmed: they are listed and runnable, but
+		// Remove will not touch them.
+		edDrawListView(s, edListViewRect(), "No tools", func(i int) rl.Color {
+			if i < len(edTools) && edTools[i].fixed {
+				return edEgaLightGray
+			}
+			return edEgaYellow
+		})
+
+		by := float32(y+h) - float32(edBtnH()) - 6
+		bh, bw := float32(edBtnH()), float32(66)
+		right := float32(x + w - 10)
+		btn := func(label string) bool {
+			right -= bw
+			hit := raygui.Button(rl.NewRectangle(right, by, bw, bh), label)
+			right -= 8
+			return hit
+		}
+		if btn("Close") {
+			s.dlg = edDlgNone
+			return
+		}
+		if btn("Remove") {
+			edToolsRemove(s)
+			return
+		}
+		if btn("Add") {
+			edToolsAdd(s)
+			return
+		}
+		if btn("Run") {
+			edDialogConfirm(s)
+		}
+
 	case edDlgOpen, edDlgOutline, edDlgBuffers:
 		title, empty, okLabel := "Open Lua File", "No .lua files found here", "Open"
 		switch s.dlg {
@@ -683,6 +707,33 @@ func edDrawDialog(s *edState) {
 		if btn("Replace") {
 			edTakeReplaceTerms(s)
 			edReplaceOnce(s)
+		}
+
+	case edDlgToolAdd:
+		const w = int32(400)
+		boxH := edLineH + 8
+		h := 3*edLineH + boxH + 50
+		x, y := edDialogFrame("Add Tool", w, h)
+
+		promptY := y + edLineH + 8
+		edDrawStr(x+edCharW, promptY, "Name = command", edEgaBlack)
+		box := rl.NewRectangle(float32(x+edCharW), float32(promptY+edLineH+4),
+			float32(w-2*edCharW), float32(boxH))
+		if raygui.TextBox(box, &s.dlgInput, 256, true) &&
+			(rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeyKpEnter)) {
+			edDialogConfirm(s)
+			return
+		}
+		edDrawStr(x+edCharW, int32(box.Y)+boxH+4,
+			edEllipsis("%f file  %d dir  %l line", int(w/edCharW)-2), edEgaDarkGray)
+
+		by := float32(y+h) - float32(edBtnH()) - 6
+		if raygui.Button(rl.NewRectangle(float32(x+w-150), by, 66, float32(edBtnH())), "Add") {
+			edDialogConfirm(s)
+			return
+		}
+		if raygui.Button(rl.NewRectangle(float32(x+w-76), by, 66, float32(edBtnH())), "Cancel") {
+			s.openDialog(edDlgTools)
 		}
 
 	case edDlgSaveAs, edDlgFind, edDlgGoto:
