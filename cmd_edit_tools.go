@@ -42,6 +42,7 @@ type edTool struct {
 var edFixedTools = []edTool{
 	{Label: "Sprite Editor", sub: "gfx", fixed: true},
 	{Label: "Map Editor", sub: "map", fixed: true},
+	{Label: "Sound Editor", sub: "sfx", fixed: true},
 }
 
 // edTools is the live list: the fixed tools followed by the user's.

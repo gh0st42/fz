@@ -394,7 +394,7 @@ One caveat worth knowing: love block-buffers its output when it is going to a pi
 
 **Project and tools.** The **Project** menu runs the game (`F5`, same as `fz run`) and builds it (`F9`), calling `fz`'s own build straight from the editor — the archive is written on a background goroutine so the window keeps responding, and the result is reported in the status toast.
 
-The **Tools** menu is nine slots bound to `Ctrl+1` … `Ctrl+9`. The first two are the sprite (`fz gfx`) and map (`fz map`) editors, which ship with fz and cannot be changed or removed; raylib allows one window per process, so each opens as its own `fz` process in the same working directory. The remaining slots are yours.
+The **Tools** menu is nine slots bound to `Ctrl+1` … `Ctrl+9`. The first three are the sprite (`fz gfx`), map (`fz map`) and sound (`fz sfx`) editors, which ship with fz and cannot be changed or removed; raylib allows one window per process, so each opens as its own `fz` process in the same working directory. The remaining six slots are yours.
 
 **Tools → Configure...** lists every slot with its shortcut, built-in ones dimmed. `Insert` or **Add** appends a tool, `Delete` or **Remove** drops the selected one, and `Enter` or **Run** launches it. Add takes a command line, optionally named:
 
